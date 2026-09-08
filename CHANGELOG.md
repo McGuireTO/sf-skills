@@ -1,3 +1,12 @@
+# [1.53.0](https://github.com/forcedotcom/sf-skills/compare/1.52.0...1.53.0) (2026-09-08)
+
+
+### Features
+
+* Retire experience-content-media-search on main @W-23593326@ ([161b3f2](https://github.com/forcedotcom/sf-skills/commit/161b3f253944dd9b2be379a2289dabf7c5c56bea))
+
+
+
 # [1.52.0](https://github.com/forcedotcom/sf-skills/compare/1.51.0...1.52.0) (2026-09-07)
 
 
