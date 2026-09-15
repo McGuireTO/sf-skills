@@ -1,3 +1,12 @@
+# [1.55.0](https://github.com/forcedotcom/sf-skills/compare/1.54.0...1.55.0) (2026-09-15)
+
+
+### Features
+
+* Release 2 new skills - dx-org-analyze, experience-design-validate @W-24188672@ ([fc08d5b](https://github.com/forcedotcom/sf-skills/commit/fc08d5b5ff6dc47c8797d60bb219bf77e8e5fd63))
+
+
+
 # [1.54.0](https://github.com/forcedotcom/sf-skills/compare/1.53.0...1.54.0) (2026-09-11)
 
 
