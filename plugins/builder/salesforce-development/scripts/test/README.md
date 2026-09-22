@@ -82,7 +82,7 @@ so it runs offline on the Python 3.9 baseline.
 (not the full catalog), shows no banner, stays silent outside a Salesforce
 project, and never blocks.
 
-**`feedback-nudge.test.sh`** (#277) — the feedback loop is default-**OFF** and
+**`feedback-nudge.test.sh`** (W-24051166) — the feedback loop is default-**OFF** and
 self-limiting: gate off → always silent; gate on + substantive work → exactly
 one nudge per session; `record-feedback-decision` persists the opt-in. Every
 response is non-blocking.

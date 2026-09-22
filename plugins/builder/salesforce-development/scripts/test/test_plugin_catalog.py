@@ -659,6 +659,30 @@ class ScorePromptAgainstCatalogTests(unittest.TestCase):
             for match in matches
         ))
 
+    def test_expanded_experience_plugins_preserve_existing_routes_and_add_new_ones(self):
+        data = self.mod.load_catalog(PLUGIN_ROOT)
+        cases = [
+            ("add a shadcn component with Tailwind CSS to my React page", "experience-react"),
+            ("scaffold a Salesforce Angular UI bundle app", "experience-react"),
+            ("make my LWC component WCAG accessible", "experience-lwc"),
+            ("migrate this Aura component and Lightning Out app to LWC", "experience-lwc"),
+            ("find a stock image for this CMS page", "experience-cms"),
+            ("render CMS images and video accessibly in my React site", "experience-cms"),
+        ]
+        for prompt, expected in cases:
+            with self.subTest(prompt=prompt):
+                matches = self.mod.score_prompt_against_catalog(prompt, data)
+                high_names = [match.plugin["name"] for match in matches if match.band == "high"]
+                self.assertIn(expected, high_names)
+
+        for prompt in ("calculate angular momentum", "what is angular velocity"):
+            with self.subTest(prompt=prompt):
+                matches = self.mod.score_prompt_against_catalog(prompt, data)
+                self.assertFalse(any(
+                    match.plugin["name"] == "experience-react" and match.band == "high"
+                    for match in matches
+                ))
+
     def test_real_tranche_prompts_have_one_high_confidence_product_route(self):
         data = self.mod.load_catalog(PLUGIN_ROOT)
         # The real runtime (_plugin_catalog_match in sf_context.py) excludes the
@@ -891,6 +915,63 @@ class ScorePromptAgainstCatalogTests(unittest.TestCase):
                     for match in matches
                 ))
 
+    def test_code_quality_scans_and_architecture_review_route_to_the_new_plugin(self):
+        # Lever 1 peeled the Code Analyzer skills (dx-code-analyzer-*),
+        # platform-architecture-analyze, and the architecture-review agent out of
+        # salesforce-development into a standalone salesforce-code-quality plugin.
+        # For the split to pay off, static-analysis / scan / custom-rule /
+        # Well-Architected intent has to be DISCOVERABLE at that new plugin rather
+        # than silently lost with the capability it left behind. These are exactly
+        # the plugin's curated examplePrompts plus close paraphrases; each must
+        # land salesforce-code-quality as the sole high-confidence route on the
+        # proactive surface (foundation plugin excluded, as the runtime does).
+        data = self.mod.load_catalog(PLUGIN_ROOT)
+        data = {
+            **data,
+            "plugins": [p for p in data["plugins"] if p["name"] != "salesforce-development"],
+        }
+        positive_prompts = [
+            "set up Salesforce Code Analyzer for my project",
+            "scan my Apex code for security violations",
+            "run PMD and ESLint on my code",
+            "create a custom PMD rule to ban System.debug",
+            "run a Well-Architected review of my project",
+            "audit this project's architecture",
+        ]
+        for prompt in positive_prompts:
+            with self.subTest(prompt=prompt):
+                matches = self.mod.score_prompt_against_catalog(prompt, data)
+                high_names = [m.plugin["name"] for m in matches if m.band == "high"]
+                self.assertEqual(high_names, ["salesforce-code-quality"])
+
+    def test_foundation_dev_intent_does_not_leak_to_code_quality(self):
+        # Precision guard for the split: the capabilities that STAYED in
+        # salesforce-development (flow authoring, Apex generate/deploy/test, object
+        # + SOQL work) must never propose the new code-quality plugin. "code",
+        # "run", and "test" are shared scaffolding words, so a scoring regression
+        # that let them count as code-quality evidence would fire here. The
+        # foundation plugin is the always-active surface, so a leak means an
+        # unsolicited install nag for a plugin the developer's task doesn't need.
+        data = self.mod.load_catalog(PLUGIN_ROOT)
+        data = {
+            **data,
+            "plugins": [p for p in data["plugins"] if p["name"] != "salesforce-development"],
+        }
+        negative_prompts = [
+            "build a record-triggered flow for approvals",
+            "deploy my Apex classes to production",
+            "run my Apex tests",
+            "generate a custom object with fields",
+            "write a SOQL query for accounts",
+        ]
+        for prompt in negative_prompts:
+            with self.subTest(prompt=prompt):
+                matches = self.mod.score_prompt_against_catalog(prompt, data)
+                self.assertFalse(any(
+                    m.plugin["name"] == "salesforce-code-quality" and m.band == "high"
+                    for m in matches
+                ))
+
     def test_tokenize_lowercases_and_drops_stopwords_and_single_chars(self):
         # _tokenize is the front door of the scorer: everything the BM25 pass
         # sees is what survives here. Three filters run, each load-bearing:
@@ -901,7 +982,7 @@ class ScorePromptAgainstCatalogTests(unittest.TestCase):
         # exercised nowhere else -- relaxing it to `>= 1` would readmit single
         # chars as evidence with no other test failing.
         self.assertEqual(
-            self.mod._tokenize("Build a FLOW with X 5 Approvals"),
+            self.mod._tokenize("Build and show a FLOW with X 5 Approvals"),
             ["flow", "approvals"],
         )
         # A non-stoplisted single character alone tokenizes to nothing (proving the

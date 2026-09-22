@@ -2,7 +2,7 @@
   "schemaVersion": "1.0",
   "generatedFrom": {
     "marketplace": ".claude-plugin/marketplace.json",
-    "marketplaceSha256": "fe1fa8263b3af57cec6bd6223b455bbd9386feddb15c4983ce0a9c03234958cf"
+    "marketplaceSha256": "ec4b1fa21cffa9fa97d69497f85d9c4d865e6d8fbe37ece780aea229a2947b2d"
   },
   "plugins": [
     {
@@ -169,13 +169,14 @@
       "name": "experience-cms",
       "source": "./plugins/builder/experience-cms",
       "match": {
-        "description": "Author and source media for Experience Cloud content: apply CMS branding, generate CMS content, search existing Salesforce CMS or Data 360 media, and search and download ethically licensed stock imagery through Salesforce media-management tooling. Use when producing or branding CMS content for a Digital Experience site, locating an existing content asset, or finding a stock image for a page.",
+        "description": "Author and source media for Experience Cloud content: apply CMS branding, generate CMS content, search existing Salesforce CMS or Data 360 media, and search and download ethically licensed stock imagery through Salesforce media-management tooling. Use when producing or branding CMS content for a Digital Experience site, locating an existing content asset, or finding a stock image for a page. Also render accessible CMS-managed images, video, audio, and documents in React experiences.",
         "keywords": [
           "cms",
           "experience cloud",
           "content",
           "branding",
           "media search",
+          "media rendering",
           "stock image",
           "digital experience"
         ],
@@ -183,7 +184,8 @@
           "generate CMS content for my site",
           "apply my brand to the Experience Cloud site",
           "find a stock image for this page",
-          "search Salesforce CMS for an existing media asset"
+          "search Salesforce CMS for an existing media asset",
+          "render CMS images and video accessibly in my React site"
         ],
         "anchorTerms": [
           "cms",
@@ -198,10 +200,12 @@
       "name": "experience-lwc",
       "source": "./plugins/builder/experience-lwc",
       "match": {
-        "description": "Build and validate Lightning Web Components (LWC): generate components with the PICKLES methodology and 165-point scoring, scaffold a fresh LWC from a Figma design or a PRD, wire-service and Jest test patterns, SLDS styling, WCAG/ARIA accessibility validation, and RTL/TypeScript migration. Use when creating, editing, or reviewing LWC components — touching lwc/**/*.js, .html, .css, or .js-meta.xml files, or asking about wire service, base components, SLDS, Jest LWC tests, or component accessibility.",
+        "description": "Build and validate Lightning Web Components (LWC): generate components with the PICKLES methodology and 165-point scoring, scaffold a fresh LWC from a Figma design or a PRD, wire-service and Jest test patterns, SLDS styling, WCAG/ARIA accessibility validation, and RTL/TypeScript migration. Use when creating, editing, or reviewing LWC components — touching lwc/**/*.js, .html, .css, or .js-meta.xml files, or asking about wire service, base components, SLDS, Jest LWC tests, or component accessibility. Also use when migrating legacy Aura components or Lightning Out apps to LWC.",
         "keywords": [
           "lwc",
           "lightning web component",
+          "aura migration",
+          "lightning out",
           "wire service",
           "jest",
           "slds",
@@ -214,7 +218,8 @@
           "build me an LWC datatable",
           "create a lightning web component",
           "convert this Figma design into an LWC",
-          "make my component WCAG accessible"
+          "make my component WCAG accessible",
+          "migrate this Aura component or Lightning Out app to LWC"
         ],
         "anchorTerms": [
           "lwc"
@@ -225,9 +230,10 @@
       "name": "experience-react",
       "source": "./plugins/builder/experience-react",
       "match": {
-        "description": "Build Salesforce React UI Bundle apps: scaffold a new React UI bundle SFDX starter project from a template, generate and edit pages, components, layout, styling, navigation, and branding with shadcn/ui and Tailwind CSS, configure ui-bundle metadata, host the app on a Digital Experience Site, and deploy it to an org. Use when creating or editing a React frontend under uiBundles/*/src for a Salesforce site — appLayout.tsx, routes.tsx, src/pages/, src/components/, or when starting, scaffolding, hosting, or deploying a React UI bundle app.",
+        "description": "Build Salesforce React UI Bundle apps: scaffold a new React UI bundle SFDX starter project from a template, generate and edit pages, components, layout, styling, navigation, and branding with shadcn/ui and Tailwind CSS, configure ui-bundle metadata, host the app on a Digital Experience Site, and deploy it to an org. Use when creating or editing a React frontend under uiBundles/*/src for a Salesforce site — appLayout.tsx, routes.tsx, src/pages/, src/components/, or when starting, scaffolding, hosting, or deploying a React UI bundle app. Also scaffold, configure features for, host, and deploy Angular UI Bundle apps.",
         "keywords": [
           "react",
+          "angular",
           "ui bundle",
           "tsx",
           "tailwind",
@@ -238,13 +244,24 @@
         "examplePrompts": [
           "scaffold a new React UI bundle app",
           "add a shadcn component to my tsx page",
-          "build a Digital Experience site with React"
+          "build a Digital Experience site with React",
+          "scaffold a Salesforce Angular UI bundle app"
         ],
         "anchorTerms": [
           "react",
+          "angular",
           "shadcn",
           "tsx"
-        ]
+        ],
+        "anchorCompanions": {
+          "angular": [
+            "ui",
+            "bundle",
+            "frontend",
+            "experience",
+            "site"
+          ]
+        }
       }
     },
     {
@@ -418,10 +435,52 @@
       }
     },
     {
+      "name": "salesforce-code-quality",
+      "source": "./plugins/builder/salesforce-code-quality",
+      "match": {
+        "description": "Analyze and govern Salesforce code quality with Salesforce Code Analyzer and the Well-Architected framework: set up and troubleshoot Code Analyzer, run security/performance/best-practice/style scans across engines (PMD, ESLint, CPD, RetireJS, Flow, SFGE, ApexGuru), author custom Regex/PMD/ESLint rules, and run a multi-pillar Well-Architected architecture review with file:line evidence. Use for static analysis, code scanning, quality gates, custom lint rules, or a holistic architecture/Well-Architected audit — includes a read-only architecture-review agent.",
+        "keywords": [
+          "salesforce code analyzer",
+          "static analysis",
+          "code scan",
+          "pmd",
+          "eslint",
+          "sfge",
+          "apexguru",
+          "retirejs",
+          "cpd",
+          "custom rule",
+          "quality gate",
+          "well-architected",
+          "architecture review",
+          "code quality"
+        ],
+        "examplePrompts": [
+          "set up Salesforce Code Analyzer for my project",
+          "scan my Apex code for security violations",
+          "run PMD and ESLint on my code",
+          "create a custom PMD rule to ban System.debug",
+          "run a Well-Architected review of my project",
+          "audit this project's architecture"
+        ],
+        "anchorTerms": [
+          "analyzer",
+          "pmd",
+          "sfge",
+          "apexguru",
+          "retirejs",
+          "cpd",
+          "architecture",
+          "architected",
+          "violations"
+        ]
+      }
+    },
+    {
       "name": "salesforce-development",
       "source": "./plugins/builder/salesforce-development",
       "match": {
-        "description": "Foundation layer for Salesforce platform development — 37 skills for environment validation, project scaffolding, scratch-org lifecycle, declarative metadata, Apex (author, run anonymous, test, debug), flow automation, SOQL, deploy/retrieve, manifest generation, security, code analysis, Well-Architected review, reporting, and generated installed-versus-available capability discovery, plus a read-only architecture-review agent, org-context detection, a production deploy-safety gate, and a bundled Apex + SOQL language server (MCP).",
+        "description": "Foundation layer for Salesforce platform development — 37 skills for environment validation, project scaffolding, scratch-org lifecycle, declarative metadata, Apex (author, run anonymous, test, debug), flow automation, SOQL, deploy/retrieve, manifest generation, security, reporting, and generated installed-versus-available capability discovery, plus org-context detection, a production deploy-safety gate, and a bundled Apex + SOQL language server (MCP).",
         "keywords": [
           "salesforce",
           "apex",

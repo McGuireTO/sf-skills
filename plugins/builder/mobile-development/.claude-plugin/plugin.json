@@ -1,7 +1,7 @@
 {
   "name": "mobile-development",
   "displayName": "Salesforce Mobile Development",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Build and extend native Salesforce mobile apps on iOS and Android. Bundles skills for scaffolding new Mobile SDK apps, adding Mobile SDK to existing apps, Salesforce authentication, offline storage (SmartStore) and sync (MobileSync), biometric login, native device capabilities, and embedding Agentforce.",
   "author": { "name": "Salesforce" },
   "license": "Apache-2.0",

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from _test_support import load_module, strip_ansi
@@ -16,6 +17,7 @@ from _test_support import load_module, strip_ansi
 SCRIPTS = Path(__file__).resolve().parent.parent
 PLUGIN_ROOT = SCRIPTS.parent
 SFX = load_module(SCRIPTS / "sf_context.py", "ui_modes_context")
+NR = load_module(SCRIPTS / "nudge_rules.py", "ui_modes_nudge_rules")
 PLUGIN_JSON = PLUGIN_ROOT / ".claude-plugin/plugin.json"
 
 STATE = {
@@ -32,6 +34,16 @@ STATE = {
     "context": {"project": "acme", "orgAlias": "dev", "orgStatus": "unprobed"},
 }
 
+# A stand-in for the SessionStart nudge seed (journey-nudges Phase 4): the exact
+# selection logic isn't under test here, just that cmd_detect seeds the signature
+# with whatever `_select_inline_nudge` returns. message/action (journey-nudges
+# Phase 5) are needed too, since the seeded candidate now also feeds the
+# model-facing "next action" text via `_nudge_next_action_text`.
+SEED_CANDIDATE = SimpleNamespace(
+    dedup_key="test.seed", evidence_fp="v1",
+    message="Seed message.", action="sf seed action",
+)
+
 
 class UiModeContracts(unittest.TestCase):
     def test_manifest_declares_ui_mode_string_option_with_full_default(self):
@@ -40,14 +52,16 @@ class UiModeContracts(unittest.TestCase):
         self.assertIn("ui_mode", config)
         self.assertEqual(config["ui_mode"]["type"], "string")
         self.assertEqual(config["ui_mode"]["default"], "full")
+        self.assertEqual(config["ui_mode"]["options"], ["full", "plain", "off"])
         self.assertIn("full", config["ui_mode"]["description"])
-        self.assertIn("compact", config["ui_mode"]["description"])
         self.assertIn("plain", config["ui_mode"]["description"])
         self.assertIn("off", config["ui_mode"]["description"])
 
     def test_missing_empty_and_invalid_values_fail_safe_to_full(self):
+        # "compact" was retired — a stored value maps to "plain" (nearest surviving
+        # reduced-chrome surface); other unknown values still fail safe to "full".
         for raw, expected in ((None, "full"), ("", "full"), ("bogus", "full"),
-                              ("FULL", "full"), ("compact", "compact"),
+                              ("FULL", "full"), ("compact", "plain"),
                               ("plain", "plain"), ("off", "off")):
             env = {} if raw is None else {"CLAUDE_PLUGIN_OPTION_UI_MODE": raw}
             with self.subTest(raw=raw), mock.patch.dict(os.environ, env, clear=True):
@@ -55,21 +69,41 @@ class UiModeContracts(unittest.TestCase):
 
     def test_ambient_surface_mode_matrix_and_no_color_orthogonality(self):
         full = "\x1b[32mFULL ART ●◉○\x1b[0m"
+        # A real SEV_ROUTINE, non-hygiene candidate → the "Try next" band (journey-nudges
+        # Phase 8), so the plain surface's band WORD is asserted non-vacuously.
+        candidate = NR.Candidate(
+            id="build.empty-scaffold", stage="Build", severity=NR.SEV_ROUTINE,
+            confidence=NR.CONFIDENCE_A, action="sf lightning generate component",
+            message="Your project has no local source yet.", dedup_key="build.empty-scaffold",
+        )
+        # Mode taxonomy consolidated to full / plain / off (the legacy "compact"
+        # alias now resolves to "plain" in _ui_mode, so it produces the same
+        # accessible semantic block — no separate one-line projection).
         cases = {}
         for mode in ("full", "compact", "plain", "off"):
             with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_UI_MODE": mode}, clear=True):
-                cases[mode] = SFX._ambient_surface(full, STATE, project_name="acme")
+                cases[mode] = SFX._ambient_surface(
+                    full, STATE, project_name="acme", candidate=candidate)
         self.assertEqual(cases["full"], full)
         self.assertIsNone(cases["off"])
-        self.assertNotIn("FULL ART", cases["compact"])
-        self.assertIn("salesforce-development", cases["compact"])
-        self.assertIn("Build", cases["compact"])
-        self.assertLessEqual(max(map(SFX._terminal_cell_width, cases["compact"].splitlines())), 80)
+        # The legacy "compact" alias projects identically to "plain".
+        self.assertEqual(cases["compact"], cases["plain"])
+        self.assertNotIn("FULL ART", cases["plain"])
         self.assertNotIn("\x1b", cases["plain"])
         self.assertNotRegex(cases["plain"], r"[●◉○]")
         self.assertIn("Current stage: Build", cases["plain"])
-        self.assertIn("Reached: Connect, Project", cases["plain"])
-        self.assertIn("No evidence: Build, Test, Deploy, Observe", cases["plain"])
+        # Content parity with the primary surfaces: no Reached / No-evidence word-lists,
+        # and the semantic-plain surface stays emoji-free — the band is announced by its
+        # plain WORD instead ("Try next:"), replacing the old literal "Next:".
+        self.assertNotIn("Reached:", cases["plain"])
+        self.assertNotIn("No evidence:", cases["plain"])
+        self.assertNotRegex(cases["plain"], r"[❌⚠🚀✨]")
+        self.assertIn("Try next: Your project has no local source yet.", cases["plain"])
+        # This accessibility surface is DELIBERATELY excluded from the two-line arrow
+        # reformat (journey-nudges Phase 8): a literal "→" reads poorly to a screen
+        # reader. The action stays inline after " — ", and no arrow leader appears.
+        self.assertIn(" — ", cases["plain"])
+        self.assertNotIn("→", cases["plain"])
         with mock.patch.dict(os.environ, {
             "CLAUDE_PLUGIN_OPTION_UI_MODE": "full", "NO_COLOR": "1"
         }, clear=True):
@@ -103,17 +137,32 @@ class UiModeContracts(unittest.TestCase):
                         mock.patch.object(SFX, "_configured_target_alias", return_value="dev"), \
                         mock.patch.object(SFX, "_record_welcomed") as welcomed, \
                         mock.patch.object(SFX, "_record_entered") as entered, \
-                        mock.patch.object(SFX, "_record_rail_signature") as signature, \
+                        mock.patch.object(
+                            SFX, "_select_inline_nudge", return_value=SEED_CANDIDATE) as select_nudge, \
+                        mock.patch.object(SFX, "_record_nudge_signature") as signature, \
                         mock.patch.object(SFX.sys, "stdin", payload), redirect_stdout(out):
                     self.assertEqual(SFX.cmd_detect(), 0)
-                if source == "compact" or mode == "off":
+                if source == "compact":
+                    # The compact-resume reinject short-circuits before any journey/
+                    # nudge state is touched at all.
+                    welcomed.assert_not_called()
+                    entered.assert_not_called()
+                    select_nudge.assert_not_called()
+                    signature.assert_not_called()
+                elif mode == "off":
+                    # journey-nudges Phase 5: the model-facing context (additionalContext)
+                    # is emitted unconditionally, regardless of ui_mode, and now derives
+                    # its "next action" text from the SAME selected candidate as every
+                    # other surface — so _select_inline_nudge still runs here. Only the
+                    # VISIBLE ambient surface and its welcomed/entered/signature
+                    # bookkeeping are skipped, since `_ambient_surface` returns None.
                     welcomed.assert_not_called()
                     entered.assert_not_called()
                     signature.assert_not_called()
                 else:
                     welcomed.assert_called_once_with("ui-mode")
                     entered.assert_called_once_with("ui-mode")
-                    signature.assert_called_once_with("ui-mode", STATE)
+                    signature.assert_called_once_with("ui-mode", SEED_CANDIDATE)
                 return json.loads(out.getvalue())
             finally:
                 os.chdir(old)
@@ -142,14 +191,14 @@ class UiModeContracts(unittest.TestCase):
         )])
 
     def test_session_start_context_is_invariant_and_off_only_hides_visible_ambient_ui(self):
-        results = {mode: self.capture_detect(mode) for mode in ("full", "compact", "plain", "off")}
+        results = {mode: self.capture_detect(mode) for mode in ("full", "plain", "off")}
         contexts = {
             result["hookSpecificOutput"]["additionalContext"] for result in results.values()
         }
         self.assertEqual(len(contexts), 1)
         self.assertIn("skills first", contexts.pop().lower())
         self.assertIn(SFX.BANNER_WORDMARK, strip_ansi(results["full"]["systemMessage"]))
-        self.assertNotIn(SFX.BANNER_WORDMARK, results["compact"]["systemMessage"])
+        self.assertNotIn(SFX.BANNER_WORDMARK, results["plain"]["systemMessage"])
         self.assertIn("Current stage: Build", results["plain"]["systemMessage"])
         self.assertNotIn("systemMessage", results["off"])
 
@@ -181,10 +230,10 @@ class UiModeContracts(unittest.TestCase):
                         payload=payload, prompt_context=context
                     ), 0)
                 self.assertEqual(json.loads(out.getvalue()), {"continue": True})
-                self.assertFalse(SFX._rail_painted_this_turn(context))
+                self.assertFalse(SFX._nudge_painted_this_turn(context))
                 self.assertFalse(SFX._welcomed_this_session("ui-off"))
                 self.assertFalse(SFX._entered_this_session("ui-off"))
-                self.assertIsNone(SFX._last_rail_signature("ui-off"))
+                self.assertIsNone(SFX._last_nudge_signature("ui-off"))
             finally:
                 SFX._PROMPT_RUNTIME_DIR = old_runtime
                 SFX._WELCOME_MARKER_DIR = old_markers
@@ -226,8 +275,8 @@ class UiModeContracts(unittest.TestCase):
                     "hookSpecificOutput"]["additionalContext"])
                 self.assertNotIn("systemMessage", result)
                 context = SFX._prompt_context(payload, rotate_fallback=False)
-                self.assertFalse(SFX._rail_painted_this_turn(context))
-                self.assertIsNone(SFX._last_rail_signature("wayfinder-off"))
+                self.assertFalse(SFX._nudge_painted_this_turn(context))
+                self.assertIsNone(SFX._last_nudge_signature("wayfinder-off"))
             finally:
                 SFX._PROMPT_RUNTIME_DIR = old_runtime
                 SFX._WELCOME_MARKER_DIR = old_markers
@@ -236,7 +285,7 @@ class UiModeContracts(unittest.TestCase):
     def test_resolution_trace_is_ambient_but_keeps_evidence_side_effects(self):
         payload = {"tool_input": {"skill": "salesforce-development:platform-apex-generate"}}
         results = {}
-        for mode in ("full", "compact", "plain", "off"):
+        for mode in ("full", "plain", "off"):
             out = io.StringIO()
             with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_UI_MODE": mode}, clear=True), \
                     mock.patch.object(SFX, "_read_hook_payload", return_value=payload), \
@@ -244,7 +293,6 @@ class UiModeContracts(unittest.TestCase):
                 self.assertEqual(SFX.cmd_resolution_trace(), 0)
             results[mode] = json.loads(out.getvalue())
         self.assertIn("systemMessage", results["full"])
-        self.assertIn("systemMessage", results["compact"])
         self.assertNotIn("\x1b", results["plain"]["systemMessage"])
         self.assertNotIn("systemMessage", results["off"])
 
@@ -254,7 +302,7 @@ class UiModeContracts(unittest.TestCase):
             "message": "Install the CLI before continuing.",
         }]}
         readiness = []
-        for mode in ("full", "compact", "plain", "off"):
+        for mode in ("full", "plain", "off"):
             with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_UI_MODE": mode}, clear=True):
                 readiness.append(SFX.render_readiness_text(report))
         self.assertEqual(len(set(readiness)), 1)
@@ -262,17 +310,28 @@ class UiModeContracts(unittest.TestCase):
         self.assertIn("Install the CLI", readiness[0])
 
     def test_explicit_journey_output_is_identical_in_every_mode(self):
+        """`cmd_journey`'s bare stdout is the `journey hints` list now (journey-nudges
+        Phase 3), resolved via `_journey_state_with_org` + `_all_journey_hints` rather
+        than the old bare `_journey_state`. Mock both so the render is deterministic
+        and isolated from the real filesystem/git facts `_all_journey_hints` would
+        otherwise read, then confirm the ambient UI mode never affects this
+        model-reproduced surface."""
+        hint = SimpleNamespace(message="Add tests for 3 changed classes.",
+                                action="platform-apex-test-generate")
         outputs = []
-        for mode in ("full", "compact", "plain", "off"):
+        for mode in ("full", "plain", "off"):
             out = io.StringIO()
             with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_UI_MODE": mode}, clear=True), \
-                    mock.patch.object(SFX, "_journey_state", return_value=STATE), redirect_stdout(out):
+                    mock.patch.object(SFX, "_journey_state_with_org",
+                                       return_value=(STATE, Path("/tmp/ui-mode-fixture"), {"alias": "dev"})), \
+                    mock.patch.object(SFX, "_all_journey_hints", return_value=[hint]), \
+                    redirect_stdout(out):
                 self.assertEqual(SFX.cmd_journey([]), 0)
             outputs.append(out.getvalue())
         self.assertEqual(len(set(outputs)), 1)
-        # The visible rail is signpost-only now (no state summary); assert a mode-invariant
-        # signpost label rather than the removed "current: Build" summary line.
-        self.assertIn("build", outputs[0])
+        # The visible surface is the journey hints list now (no state summary); assert
+        # a mode-invariant hint line rather than the removed "current: Build" line.
+        self.assertIn("Add tests for 3 changed classes.", outputs[0])
 
 
 if __name__ == "__main__":

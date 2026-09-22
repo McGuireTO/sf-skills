@@ -1,5 +1,5 @@
 #!/bin/bash
-# Decision test for `sf-context feedback-nudge` + `record-feedback-decision` (#277).
+# Decision test for `sf-context feedback-nudge` + `record-feedback-decision`; see W-24051166.
 #
 # The feedback loop is the suite's first step toward an off-machine data path, so
 # its gate must be provably default-OFF and its trigger provably self-limiting.

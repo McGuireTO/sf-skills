@@ -28,6 +28,7 @@ import time
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -38,6 +39,7 @@ _MODULE_PATH = Path(__file__).resolve().parent.parent / "sf_context.py"
 # The real BM25 scorer, loaded for the end-to-end sensitivity-passthrough test
 # (the one place a stub scorer would hide a broken resolver->scorer join).
 CATALOG_MODULE_PATH = Path(__file__).resolve().parent.parent / "plugin_catalog.py"
+PLUGIN_JSON = Path(__file__).resolve().parent.parent.parent / ".claude-plugin/plugin.json"
 
 from _test_support import load_module  # noqa: E402
 
@@ -426,6 +428,86 @@ class GetTargetOrgTests(unittest.TestCase):
                              {"SF_TARGET_ORG": "sfOrg", "SFDX_TARGET_ORG": "sfdxOrg"},
                              clear=False):
             self.assertEqual(sfx.get_target_org_detailed(), ("sfOrg", ""))
+
+
+class ScratchExpiryDaysParseTests(unittest.TestCase):
+    """journey-nudges Phase 6 (C5): the date-only parse feeding
+    NudgeInputs.scratch_expiry_days. `expirationDate` is a DATE-ONLY "YYYY-MM-DD"
+    string — never a timestamp (that's the sibling `trailExpirationDate` field,
+    a different value this must never be confused with)."""
+
+    def test_future_date_yields_positive_days(self):
+        future = (date.today() + timedelta(days=5)).isoformat()
+        self.assertEqual(sfx._scratch_expiry_days(future), 5)
+
+    def test_today_yields_zero_not_none(self):
+        self.assertEqual(sfx._scratch_expiry_days(date.today().isoformat()), 0)
+
+    def test_past_date_yields_negative_days(self):
+        # The observed live nuance: expirationDate can already be in the past
+        # while `isExpired` is still False. The parse itself doesn't special-case
+        # that — it just reports the (negative) day count; callers decide meaning.
+        past = (date.today() - timedelta(days=2)).isoformat()
+        self.assertEqual(sfx._scratch_expiry_days(past), -2)
+
+    def test_none_and_empty_are_not_a_crash(self):
+        self.assertIsNone(sfx._scratch_expiry_days(None))
+        self.assertIsNone(sfx._scratch_expiry_days(""))
+
+    def test_malformed_and_timestamp_shaped_strings_fail_closed(self):
+        # Guards the sibling-field mixup this function's docstring warns about:
+        # a full ISO timestamp (trailExpirationDate's shape) must never silently
+        # parse as if it were the date-only expirationDate field.
+        for bad in ("not-a-date", "2026-09-15T10:00:00.000+0000", "2026/09/15", 12345):
+            with self.subTest(value=bad):
+                self.assertIsNone(sfx._scratch_expiry_days(bad))
+
+
+class ResolveOrgInfoScratchExpiryTests(unittest.TestCase):
+    """resolve_org_info must carry expirationDate/isExpired straight through from
+    the `sf org list` scratchOrgs[] record (journey-nudges Phase 6, C5) — the raw
+    fields, unparsed; _gather_nudge_inputs does the date math."""
+
+    def test_scratch_match_carries_expiration_fields_through(self):
+        org_list = {"scratchOrgs": [{
+            "alias": "my-scratch", "username": "u@example.com", "orgId": "00D000000000001",
+            "isScratch": True, "expirationDate": "2026-09-20", "isExpired": False,
+        }], "nonScratchOrgs": []}
+        org_display = {"alias": "my-scratch", "username": "u@example.com"}
+        info = sfx.resolve_org_info("my-scratch", org_list=org_list, org_display=org_display)
+        self.assertEqual(info["expirationDate"], "2026-09-20")
+        self.assertFalse(info["isExpired"])
+
+    def test_scratch_match_carries_confirmed_expired_through(self):
+        # journey-nudges Phase 6 (C5 round 2): isExpired=True must propagate too —
+        # this is the flag the new connect_scratch_expired rule reads, so a false
+        # negative here would silently disable that rule.
+        org_list = {"scratchOrgs": [{
+            "alias": "v20-cap-target-scratch-sep05", "username": "u@example.com",
+            "orgId": "00D000000000003", "isScratch": True,
+            "expirationDate": "2026-09-11", "isExpired": True,
+        }], "nonScratchOrgs": []}
+        org_display = {"alias": "v20-cap-target-scratch-sep05", "username": "u@example.com"}
+        info = sfx.resolve_org_info(
+            "v20-cap-target-scratch-sep05", org_list=org_list, org_display=org_display)
+        self.assertEqual(info["expirationDate"], "2026-09-11")
+        self.assertTrue(info["isExpired"])
+
+    def test_non_scratch_match_has_no_expiration(self):
+        org_list = {"nonScratchOrgs": [{
+            "alias": "prod1", "username": "u@example.com", "orgId": "00D000000000002",
+        }], "scratchOrgs": []}
+        org_display = {"alias": "prod1", "username": "u@example.com"}
+        info = sfx.resolve_org_info("prod1", org_list=org_list, org_display=org_display)
+        self.assertIsNone(info["expirationDate"])
+        self.assertFalse(info["isExpired"])
+
+    def test_stale_auth_fallback_has_no_expiration(self):
+        org_display = {"alias": "gone", "username": "u@example.com"}
+        info = sfx.resolve_org_info(
+            "gone", org_list={"scratchOrgs": [], "nonScratchOrgs": []}, org_display=org_display)
+        self.assertIsNone(info["expirationDate"])
+        self.assertFalse(info["isExpired"])
 
 
 class RunResultTests(unittest.TestCase):
@@ -1633,6 +1715,42 @@ class ScaffoldGateTests(unittest.TestCase):
         self.assertIn("platform-environment-validate", reason)
         self.assertRegex(reason, r"(?i)isn't on your path")
 
+    def test_template_generate_project_form_is_gated_like_project_generate(self):
+        # `sf project generate` is the deprecated alias for `sf template generate
+        # project`; the gate must fire on BOTH so switching to the non-deprecated
+        # form doesn't silently drop the readiness backstop.
+        for cmd in ("sf template generate project --name acme",
+                    "sf template generate project -t agent -n acme"):
+            with self.subTest(cmd=cmd):
+                with mock.patch.object(sfx, "resolve_executable", return_value=None):
+                    _, result = self.run_gate(cmd)
+                self.assertEqual(self._decision(result), "deny")
+        # A different `template generate` subcommand is NOT a project scaffold →
+        # stays silent (no PATH resolve, no verdict read).
+        with mock.patch.object(sfx, "resolve_executable") as rex, \
+                mock.patch.object(sfx, "_load_readiness_state") as lrs:
+            code, result = self.run_gate("sf template generate apex-class -n Foo")
+        self.assertEqual((code, result), (0, {"continue": True}))
+        rex.assert_not_called()
+        lrs.assert_not_called()
+
+    def test_plugin_json_registers_scaffold_gate_for_both_command_forms(self):
+        # The Python matcher fires on both `sf project generate` and the
+        # non-deprecated `sf template generate project`, but a host that honors the
+        # plugin.json `if:` filter only invokes the hook for the forms registered
+        # there. Both forms MUST have an `if:` → scaffold-gate entry, or switching to
+        # the canonical command silently drops the readiness gate on such hosts.
+        plugin = json.loads(PLUGIN_JSON.read_text(encoding="utf-8"))
+        scaffold_ifs = {
+            handler.get("if")
+            for block in plugin["hooks"].get("PreToolUse", [])
+            for handler in block.get("hooks", [])
+            if isinstance(handler.get("command"), str)
+            and handler["command"].endswith("sf-context scaffold-gate")
+        }
+        self.assertIn("Bash(sf project generate*)", scaffold_ifs)
+        self.assertIn("Bash(sf template generate project*)", scaffold_ifs)
+
     def test_ran_and_failed_verdict_for_this_toolchain_denies(self):
         # A scan that RAN and FAILED under the CURRENT signature is known-broken →
         # block, naming what needs attention.
@@ -1643,6 +1761,30 @@ class ScaffoldGateTests(unittest.TestCase):
         reason = result["hookSpecificOutput"]["permissionDecisionReason"]
         self.assertIn("Git", reason)
         self.assertIn("Node.js", reason)
+
+    def test_help_flag_is_never_gated_even_when_verdict_is_broken(self):
+        # `sf template generate project --help` is how dx-project-create reads the
+        # live template list -- it creates nothing, so readiness is irrelevant. It
+        # must pass silently even when a known-broken verdict would deny the real
+        # scaffold, and without a PATH resolve or verdict read.
+        for cmd in ("sf template generate project --help",
+                    "sf template generate project -h",
+                    "sf project generate --help",
+                    "sf project generate -t agent -n acme --help"):
+            with self.subTest(cmd=cmd):
+                with mock.patch.object(sfx, "resolve_executable") as rex, \
+                        mock.patch.object(sfx, "_load_readiness_state") as lrs:
+                    code, result = self.run_gate(cmd)
+                self.assertEqual((code, result), (0, {"continue": True}))
+                self.assertIsNone(self._decision(result))
+                rex.assert_not_called()
+                lrs.assert_not_called()
+        # A value that merely CONTAINS "-h" (e.g. a project named "-help-ish" would
+        # fail the skill's allowlist anyway, but a substring like "graph" must not be
+        # mistaken for the flag) still gates normally.
+        with mock.patch.object(sfx, "resolve_executable", return_value=None):
+            _, result = self.run_gate("sf project generate --name graphapp")
+        self.assertEqual(self._decision(result), "deny")
 
     def test_fresh_pass_allows_silently(self):
         with mock.patch.object(sfx, "resolve_executable", return_value="/usr/local/bin/sf"):
@@ -1697,6 +1839,378 @@ class ScaffoldGateTests(unittest.TestCase):
         with mock.patch.object(sfx, "_read_hook_payload", side_effect=RuntimeError("boom")):
             _, result = self.run_gate("sf project generate --name acme")
         self.assertEqual(result, {"continue": True})
+
+
+class ScaffoldPaintTests(unittest.TestCase):
+    """`cmd_scaffold_paint` / `cmd_post_bash` dispatch — the mid-session "entered a
+    project" trigger (entered-project-splash plan, Change 1). A successful
+    `sf project generate` paints the SAME degraded banner cmd_detect paints at
+    SessionStart, pointed at the just-created subdir (never at cwd, which is
+    pinned to the launch directory for the whole session)."""
+
+    def setUp(self):
+        self._prev_cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+        self._orig_marker_dir = sfx._WELCOME_MARKER_DIR
+        sfx._WELCOME_MARKER_DIR = Path(self._tmp.name) / "session-markers"
+
+    def tearDown(self):
+        sfx._WELCOME_MARKER_DIR = self._orig_marker_dir
+        os.chdir(self._prev_cwd)
+        self._tmp.cleanup()
+
+    def _write_project(self, relative_dir, name="Widgets"):
+        root = Path(self._tmp.name) / relative_dir
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "sfdx-project.json").write_text(
+            json.dumps({"name": name, "sourceApiVersion": "60.0"}), encoding="utf-8"
+        )
+        return root
+
+    def _post_bash(self, command, *, exit_code=0, session_id="s-scaffold"):
+        payload = {
+            "tool_input": {"command": command},
+            "tool_response": {"exitCode": exit_code},
+            "session_id": session_id,
+        }
+        out = io.StringIO()
+        with mock.patch.object(sfx, "_read_hook_payload", return_value=payload), \
+                mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(out):
+            code = sfx.cmd_post_bash()
+        return code, json.loads(out.getvalue())
+
+    def test_successful_generate_paints_pointed_at_the_created_subdir(self):
+        # No sfdx-project.json at cwd (project_meta(project_root=None) would default
+        # to the generic "Project" name), but the created subdir has a real one named
+        # "Widgets" -- proving the paint reads the SUBDIR, not cwd.
+        self._write_project("Widgets", name="Widgets")
+        code, result = self._post_bash("sf project generate --name Widgets")
+        self.assertEqual(code, 0)
+        self.assertIn("Widgets", result["systemMessage"])
+        self.assertTrue(sfx._welcomed_this_session("s-scaffold"))
+
+    def test_once_gate_suppresses_a_second_paint_this_session(self):
+        self._write_project("Widgets", name="Widgets")
+        sfx._record_welcomed("s-scaffold")
+        code, result = self._post_bash("sf project generate --name Widgets")
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {"continue": True})
+
+    def test_scaffold_paint_threads_the_journey_nudge_candidate(self):
+        # Regression (the reported "no journey hint on project creation"): the scaffold
+        # splash used to pass candidate=None, so the banner's journey-nudge slot stayed
+        # empty and it fell back to the generic ✳ "New here?" pointer with no applicable
+        # next step. It must resolve _select_inline_nudge for the CREATED project and
+        # thread that candidate into all three consumers — the visible banner, the
+        # model-facing context, and the ambient surface — exactly as cmd_detect does at
+        # SessionStart, so the fresh-scaffold next step (connect / set default / build)
+        # reaches the user instead of a generic pointer.
+        self._write_project("Widgets", name="Widgets")
+        sentinel = object()
+        captured = {}
+
+        def fake_banner(org_group, **kwargs):
+            captured["banner"] = kwargs.get("candidate")
+            return "BANNER"
+
+        def fake_ctx(**kwargs):
+            captured["ctx"] = kwargs.get("candidate")
+            return {"ok": True}
+
+        def fake_ambient(msg, state, **kwargs):
+            captured["ambient"] = kwargs.get("candidate")
+            return msg
+
+        with mock.patch.object(sfx, "_select_inline_nudge", return_value=sentinel) as pick, \
+                mock.patch.object(sfx, "render_degraded_banner", side_effect=fake_banner), \
+                mock.patch.object(sfx, "_session_model_context", side_effect=fake_ctx), \
+                mock.patch.object(sfx, "_ambient_surface", side_effect=fake_ambient):
+            code, _ = self._post_bash("sf project generate --name Widgets")
+
+        self.assertEqual(code, 0)
+        pick.assert_called()                          # the nudge is resolved (it never was before)
+        self.assertFalse(pick.call_args.kwargs.get("probe_git", True))  # local-first, like SessionStart
+        # just_scaffolded=True is set ONLY here — it flips a source-shipping template's
+        # premature deploy.never-deployed to build.just-scaffolded's "start building" hint.
+        self.assertTrue(pick.call_args.kwargs.get("just_scaffolded", False))
+        self.assertIs(captured["banner"], sentinel)   # threaded into the visible banner
+        self.assertIs(captured["ctx"], sentinel)      # ...and the model-facing context
+        self.assertIs(captured["ambient"], sentinel)  # ...and the ambient surface
+
+    def test_scaffold_selects_build_hint_when_plain_ladder_is_quiet(self):
+        # End-to-end at the sf_context layer (the pure-rule proof lives in
+        # test_nudge_rules): a real react/angular scaffold ships sample source AND a
+        # sample test, so the fresh project reaches Build *and* Test — Build becomes a
+        # reached, non-frontier stage and the plain `select` ladder drops the
+        # "start building" hint to rung 99, leaving the splash slot empty (its only
+        # other candidate, deploy.never-deployed, is suppressed on just_scaffolded).
+        # cmd_scaffold_paint passes just_scaffolded=True, which routes
+        # `_select_inline_nudge` through select_for_scaffold and surfaces the plain,
+        # plugin-agnostic build hint instead of nothing.
+        root = Path(self._tmp.name) / "MyReactApp"
+        classes = root / "force-app" / "main" / "default" / "classes"
+        classes.mkdir(parents=True, exist_ok=True)
+        (root / "sfdx-project.json").write_text(
+            json.dumps({
+                "name": "MyReactApp", "sourceApiVersion": "60.0",
+                "packageDirectories": [{"path": "force-app", "default": True}],
+                "template": "reactexternalapp",
+            }), encoding="utf-8",
+        )
+        (classes / "Foo.cls").write_text("public class Foo {}", encoding="utf-8")
+        (classes / "Foo_Test.cls").write_text(
+            "@isTest\nprivate class Foo_Test { @isTest static void t() {} }", encoding="utf-8",
+        )
+        state = sfx._derive_journey_state(
+            root, has_project=True, target="myorg", target_error="unprobed", org_display=None,
+        )
+        reached = set(sfx._reached_stage_names(state))
+        self.assertIn("Build", reached)   # sample source lit Build...
+        self.assertIn("Test", reached)    # ...and the sample test lit Test (Build now non-frontier)
+
+        # Without the scaffold signal the ladder surfaces the premature
+        # deploy.never-deployed hint (deploy the untouched boilerplate) — exactly what
+        # the splash must NOT show.
+        self.assertEqual(sfx._select_inline_nudge(
+            state, root, None, session_id="", probe_git=False, just_scaffolded=False,
+        ).id, "deploy.never-deployed")
+        # With just_scaffolded=True the splash routes through select_for_scaffold:
+        # deploy is suppressed, the ladder goes quiet, and the plain build hint wins.
+        picked = sfx._select_inline_nudge(
+            state, root, None, session_id="", probe_git=False, just_scaffolded=True,
+        )
+        self.assertEqual(picked.id, "build.just-scaffolded")
+
+    def test_prior_model_facing_note_does_not_suppress_the_scaffold_paint(self):
+        # Regression (the reported live miss): the out-of-project getting-started
+        # note records its OWN `modelnote` trip marker, NOT the visible-paint
+        # `welcome` marker. So a benign earlier "build on salesforce" mention (which
+        # fired the model note) must NOT burn the scaffold's once-gate -- the
+        # scaffold paint is the session's first VISIBLE surface and must still fire.
+        self._write_project("Widgets", name="Widgets")
+        sfx._record_model_noted("s-scaffold")   # the earlier keyword mention
+        self.assertFalse(sfx._welcomed_this_session("s-scaffold"))  # no visible paint yet
+        code, result = self._post_bash("sf project generate --name Widgets")
+        self.assertEqual(code, 0)
+        self.assertIn("Widgets", result["systemMessage"])           # it DID paint
+        self.assertTrue(sfx._welcomed_this_session("s-scaffold"))    # now recorded as painted
+
+    def test_failed_generate_stays_silent(self):
+        # A failing `sf project generate` created nothing -- with no
+        # sfdx-project.json on disk the paint stays silent (the on-disk project is
+        # the authoritative success signal; nothing landed, so nothing to paint).
+        code, result = self._post_bash(
+            "sf project generate --name Widgets", exit_code=1
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {"continue": True})
+        self.assertFalse(sfx._welcomed_this_session("s-scaffold"))
+
+    def test_cli_autoupdate_noise_does_not_eat_the_splash(self):
+        # Regression (the reported live miss): the `sf` CLI auto-updates itself on
+        # first invocation, and a slow update can make the Bash tool_response come
+        # back non-zero/interrupted even though the generate DID create the project.
+        # The created sfdx-project.json on disk is the authoritative success signal,
+        # so the splash must still fire -- external update noise must not suppress a
+        # paint for a project that demonstrably exists. (Before the guard reorder
+        # this silently no-op'd: _hook_reports_failure short-circuited ahead of the
+        # on-disk truth check, leaving no splash and no `welcome` marker.)
+        self._write_project("Widgets", name="Widgets")
+        for label, payload in (
+            ("interrupted", {"interrupted": True}),
+            ("nonzero_exit", {"exitCode": 1}),
+        ):
+            with self.subTest(label=label):
+                sid = f"s-scaffold-{label}"  # markers are per-session; fresh id each subtest
+                out = io.StringIO()
+                hook = {
+                    "tool_input": {"command": "sf project generate --name Widgets"},
+                    "tool_response": payload,
+                    "session_id": sid,
+                }
+                with mock.patch.object(sfx, "_read_hook_payload", return_value=hook), \
+                        mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(out):
+                    code = sfx.cmd_post_bash()
+                result = json.loads(out.getvalue())
+                self.assertEqual(code, 0)
+                self.assertIn("Widgets", result["systemMessage"])
+                self.assertTrue(sfx._welcomed_this_session(sid))
+
+    def test_generate_manifest_is_not_a_project_scaffold(self):
+        # `sf project generate manifest` creates a package.xml, not a project -- the
+        # subcommand token excludes it from `_is_project_generate`, so it falls
+        # through cmd_post_bash's other branches untouched (silent here, since no
+        # other matcher recognizes it either).
+        self.assertFalse(sfx._is_project_generate("sf project generate manifest --name x"))
+        code, result = self._post_bash("sf project generate manifest --name x")
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {"continue": True})
+        self.assertFalse(sfx._welcomed_this_session("s-scaffold"))
+
+    def test_help_run_is_not_a_project_scaffold(self):
+        # `sf template generate project --help`/`-h` prints usage and creates no
+        # project -- it must not fire the entered-project paint. A "-h"/"help"
+        # substring inside a value (e.g. project name "help-desk") is not the flag.
+        self.assertFalse(sfx._is_project_generate("sf template generate project --help"))
+        self.assertFalse(sfx._is_project_generate("sf template generate project -h"))
+        self.assertFalse(sfx._is_project_generate("sf project generate -t agent -n x --help"))
+        self.assertTrue(sfx._is_project_generate("sf template generate project -n help-desk"))
+        code, result = self._post_bash("sf template generate project --help")
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {"continue": True})
+        self.assertFalse(sfx._welcomed_this_session("s-scaffold"))
+
+    def test_output_dir_flag_is_honored_in_the_created_root(self):
+        # `--output-dir/-d` relocates the created project under a subdir of cwd
+        # other than the default "." -- the paint must resolve THAT path, not
+        # `cwd / name`.
+        self._write_project("out/Widgets", name="Widgets")
+        code, result = self._post_bash(
+            "sf project generate --name Widgets --output-dir out"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Widgets", result["systemMessage"])
+
+    def test_standalone_root_parser_supports_short_equals_and_quoted_flags(self):
+        cases = (
+            ("sf project generate -n Widgets -d out", "out/Widgets"),
+            ("sf project generate -n=Widgets -d=out", "out/Widgets"),
+            ("sf project generate --name=Widgets --output-dir=out", "out/Widgets"),
+            ('sf project generate --name "My Widgets" --output-dir "some out"',
+             "some out/My Widgets"),
+        )
+        for command, relative_root in cases:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    sfx._scaffold_created_root(command),
+                    (Path(self._tmp.name) / relative_root).resolve(),
+                )
+
+    def test_chained_output_dir_does_not_leak_into_the_created_root(self):
+        # A command chained after `&&` must not contribute `--output-dir` to the
+        # scaffold's root resolution — the segment is bounded at the shell operator.
+        # The REAL created project (cwd/Widgets) paints; the decoy at out/Widgets is
+        # never selected or mutated. (Before the composition fix this stayed silent;
+        # now the real project correctly paints while the leak guard still holds.)
+        created = self._write_project("Widgets", name="Widgets")
+        decoy = self._write_project("out/Widgets", name="Decoy")
+
+        code, result = self._post_bash(
+            "sf project generate --name Widgets && echo --output-dir out"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("Widgets", result["systemMessage"])            # real project painted
+        self.assertNotIn("Decoy", result["systemMessage"])           # decoy never selected
+        self.assertEqual(
+            json.loads((created / "sfdx-project.json").read_text())["template"], "standard")
+        self.assertNotIn("template", json.loads((decoy / "sfdx-project.json").read_text()))
+        self.assertTrue(sfx._welcomed_this_session("s-scaffold"))
+
+    def test_chained_name_and_output_dir_cannot_select_an_existing_project(self):
+        decoy = self._write_project("out/Existing", name="Decoy")
+
+        code, result = self._post_bash(
+            "sf project generate ; echo --name Existing --output-dir out"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {"continue": True})
+        self.assertNotIn("template", json.loads((decoy / "sfdx-project.json").read_text()))
+        self.assertFalse(sfx._welcomed_this_session("s-scaffold"))
+
+    def test_unresolvable_root_without_the_matching_project_file_stays_silent(self):
+        # The command claims a name, but nothing was actually created there (the
+        # defensive sfdx-project.json check) -- silent allow, not a guess.
+        code, result = self._post_bash("sf project generate --name GhostProject")
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {"continue": True})
+
+    def test_downstream_exception_fails_open_not_uncaught(self):
+        # A crashing PostToolUse hook must never disrupt the session (mirrors
+        # cmd_wayfinder's fail-open wrapper). Force a raise deep inside the paint
+        # path and confirm it degrades to a silent {"continue": true} instead of
+        # propagating as an uncaught traceback.
+        self._write_project("Widgets", name="Widgets")
+        with mock.patch.object(sfx, "_derive_journey_state", side_effect=RuntimeError("boom")):
+            code, result = self._post_bash("sf project generate --name Widgets")
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {"continue": True})
+        self.assertFalse(sfx._welcomed_this_session("s-scaffold"))
+
+    def test_scaffold_persists_and_shows_the_project_type_from_the_template(self):
+        # The observed `--template` is the project type. It is persisted to the created
+        # sfdx-project.json's top-level `template` key (the SF CLI records it nowhere) so
+        # later sessions and clones can show it too, and rides the header on this splash —
+        # read back through project_meta. Existing descriptor keys survive the write.
+        created = self._write_project("Widgets", name="Widgets")
+        code, result = self._post_bash(
+            "sf project generate --name Widgets --template analytics")
+        self.assertEqual(code, 0)
+        self.assertIn("analytics", result["systemMessage"])
+        data = json.loads((created / "sfdx-project.json").read_text())
+        self.assertEqual(data["template"], "analytics")
+        self.assertEqual(data["name"], "Widgets")           # existing keys preserved
+        self.assertEqual(sfx.project_meta(project_root=created)["project_type"], "analytics")
+
+    def test_scaffold_without_a_template_persists_standard(self):
+        # No `--template` → the CLI's default "standard".
+        created = self._write_project("Widgets", name="Widgets")
+        code, result = self._post_bash("sf project generate --name Widgets")
+        self.assertEqual(code, 0)
+        self.assertIn("standard", result["systemMessage"])
+        data = json.loads((created / "sfdx-project.json").read_text())
+        self.assertEqual(data["template"], "standard")
+
+    def test_project_meta_omits_type_without_a_template_key(self):
+        # A project we did not scaffold (or one from before this feature) has no
+        # `template` key — project_meta omits the type rather than guessing it.
+        created = self._write_project("Legacy", name="Legacy")
+        self.assertNotIn("project_type", sfx.project_meta(project_root=created))
+
+    def test_chained_template_flag_does_not_leak_into_the_persisted_type(self):
+        # A `--template` in a command chained after the generate must not be
+        # misattributed to the scaffold: the segment stops at `&&`, so the generate's
+        # own (absent) template resolves to the CLI default "standard", NOT the chained
+        # "analytics". The real project still paints (composition no longer suppresses).
+        created = self._write_project("Widgets", name="Widgets")
+        code, result = self._post_bash(
+            "sf project generate --name Widgets && echo --template analytics")
+        self.assertEqual(code, 0)
+        self.assertIn("standard", result["systemMessage"])
+        self.assertEqual(
+            json.loads((created / "sfdx-project.json").read_text())["template"], "standard")
+        self.assertTrue(sfx._welcomed_this_session("s-scaffold"))
+
+    def test_composed_generate_forms_still_paint(self):
+        # The reported recurring miss: models run the scaffold inside a composed
+        # command — the SKILL.md's `[ -e "{name}" ]` existence pre-check fuses into
+        # `[ ! -e X ] && sf … generate`, or they chain `&& cd` / `| tee` / `2>&1` to
+        # confirm. The old standalone-only guard silently ate the splash for every one.
+        # On-disk truth is authoritative, so each of these now paints the created project.
+        for index, command in enumerate((
+            '[ ! -e "Widgets" ] && sf project generate --name Widgets',
+            'sf project generate --name Widgets && cd Widgets',
+            'sf project generate --name Widgets | tee build.log',
+            'sf project generate --name Widgets 2>&1',
+        )):
+            with self.subTest(command=command):
+                self._write_project("Widgets", name="Widgets")
+                code, result = self._post_bash(command, session_id=f"s-composed-{index}")
+                self.assertEqual(code, 0)
+                self.assertIn("Widgets", result["systemMessage"])
+
+    def test_scaffold_leaves_an_existing_template_key_untouched(self):
+        # Write-through-that-becomes-native: once the CLI writes `template` itself, our
+        # hook must not clobber it — the key is added only when absent.
+        created = self._write_project("Widgets", name="Widgets")
+        path = created / "sfdx-project.json"
+        data = json.loads(path.read_text())
+        data["template"] = "analytics"           # as if a future CLI wrote it
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self._post_bash("sf project generate --name Widgets --template standard")
+        self.assertEqual(json.loads(path.read_text())["template"], "analytics")  # untouched
 
 
 class McpHealthContractTests(unittest.TestCase):
@@ -2226,6 +2740,27 @@ class TelemetryDispatchFailClosedTests(unittest.TestCase):
         for cmd in ("telemetry-capture", "telemetry-flush", "telemetry-transmit"):
             rc, _ = self._main_with(["sf-context", cmd])
             self.assertEqual(rc, 0, f"{cmd} must no-op (0) when the module can't load")
+
+    def test_feedback_subcommands_report_a_skip_not_silence_when_module_missing(self):
+        # feedback-eligibility/feedback-record are USER-FACING: /feedback parses their
+        # stdout JSON to decide what to tell the user. Silent empty stdout (like the
+        # bare hook no-op above) would leave it with nothing to parse, so these must
+        # still emit a parseable {"eligible": false}/{"result": "skipped"} shape.
+        out = io.StringIO()
+        with mock.patch.object(sfx, "_load_sf_telemetry", return_value=None), \
+                mock.patch.object(sfx.sys, "argv", ["sf-context", "feedback-eligibility"]), \
+                redirect_stdout(out):
+            rc = sfx.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue()), {"eligible": False, "reason": "unavailable"})
+
+        out = io.StringIO()
+        with mock.patch.object(sfx, "_load_sf_telemetry", return_value=None), \
+                mock.patch.object(sfx.sys, "argv", ["sf-context", "feedback-record", "4"]), \
+                redirect_stdout(out):
+            rc = sfx.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue()), {"result": "skipped", "reason": "unavailable"})
 
     def test_consent_command_fails_closed_when_loader_raises(self):
         # Agent review [P2]: even if the loader itself raises (not just returns None),
@@ -4145,6 +4680,7 @@ class PluginInstallLookupTests(unittest.TestCase):
                     ), \
                     mock.patch.object(sfx, "_clear_plugin_install_pending") as clear_pending, \
                     mock.patch.object(sfx, "_plugin_install_nonce") as nonce, \
+                    mock.patch.object(sfx, "_fire_plugin_install_result") as result, \
                     redirect_stderr(io.StringIO()) as stderr:
                 rc = sfx.cmd_plugin_install([
                     "experience-react", "--session-id", "sess-lookup-refusal",
@@ -4154,6 +4690,17 @@ class PluginInstallLookupTests(unittest.TestCase):
                 self.assertIn(fragment, stderr.getvalue())
             clear_pending.assert_called_once_with("sess-lookup-refusal", "experience-react")
             nonce.assert_not_called()
+            expected_reason = {
+                "catalog_unreadable": "catalog_unreadable",
+                "unknown": "unknown_plugin",
+                "self": "self_plugin",
+                "already_installed": "already_installed",
+            }[reason]
+            expected_plugin = (
+                "experience-react" if reason in ("self", "already_installed") else "unknown"
+            )
+            result.assert_called_once_with(
+                expected_reason, "sess-lookup-refusal", expected_plugin)
 
     def test_acceptance_requires_ok_lookup_result(self):
         name = "experience-react"
@@ -4225,6 +4772,16 @@ class PluginInstallTelemetryTests(unittest.TestCase):
             {"plugin": "agentforce-adlc", "origin": "external",
              "confidence": "high", "surface": "bypass-gate"})
 
+    def test_fire_plugin_install_result_carries_only_reason_and_session(self):
+        sfx._fire_plugin_install_result(
+            "subprocess_failure", "sess-result", "agentforce-adlc")
+        self.assertEqual(self._recorded, [(
+            "plugin_install_result", "",
+            {"tool_input": {
+                "plugin": "agentforce-adlc", "reason": "subprocess_failure",
+            }, "session_id": "sess-result"},
+        )])
+
     def test_dry_run_records_and_success_consumes_pending_confirmation(self):
         name = "experience-react"
         session_id = "sess-pending-install"
@@ -4251,6 +4808,7 @@ class PluginInstallTelemetryTests(unittest.TestCase):
             sfx._load_plugin_flow(session_id)["state"],
             "awaiting-confirmation",
         )
+        self.assertEqual(self._recorded[-1][2]["tool_input"]["reason"], "previewed")
 
         with mock.patch.object(
                 sfx, "_plugin_install_lookup", return_value=_plugin_lookup(entry)), \
@@ -4274,6 +4832,7 @@ class PluginInstallTelemetryTests(unittest.TestCase):
         self.assertNotIn("submit a concrete task", stdout.getvalue())
         self.assertIsNone(sfx._load_plugin_install_pending(session_id))
         self.assertEqual(sfx._load_plugin_flow(session_id)["state"], "installed")
+        self.assertEqual(self._recorded[-1][2]["tool_input"]["reason"], "installed")
 
     def test_accepted_same_marketplace_proposal_installs_in_one_call(self):
         name = "experience-react"
@@ -4334,6 +4893,7 @@ class PluginInstallTelemetryTests(unittest.TestCase):
         pending = sfx._load_plugin_install_pending(session_id)
         self.assertEqual(pending["name"], name)
         self.assertEqual(sfx._load_plugin_flow(session_id)["state"], "awaiting-confirmation")
+        self.assertEqual(self._recorded[-1][2]["tool_input"]["reason"], "previewed")
 
     def test_accepted_allowlisted_external_proposal_installs_in_one_call(self):
         # agentforce-adlc@claude-plugins-official is the one curated external
@@ -4380,6 +4940,29 @@ class PluginInstallTelemetryTests(unittest.TestCase):
             ]), 2)
         install.assert_not_called()
         self.assertIn("proposed and selected in the same session", stderr.getvalue())
+        self.assertEqual(
+            self._recorded[-1][2]["tool_input"]["reason"], "proposal_not_selected")
+
+    def test_usage_invalid_name_and_stale_nonce_have_distinct_reasons(self):
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(sfx.cmd_plugin_install([]), 2)
+        self.assertEqual(self._recorded[-1][2]["tool_input"]["reason"], "usage_error")
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(sfx.cmd_plugin_install([
+                "not/a/plugin", "--session-id", "sess-invalid",
+            ]), 2)
+        self.assertEqual(self._recorded[-1][2]["tool_input"]["reason"], "invalid_name")
+
+        name = "experience-react"
+        entry = {"source": f"./plugins/builder/{name}", "origin": "local"}
+        with mock.patch.object(
+                sfx, "_plugin_install_lookup", return_value=_plugin_lookup(entry)), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(sfx.cmd_plugin_install([
+                name, "--confirm", "0" * 64, "--session-id", "sess-stale",
+            ]), 3)
+        self.assertEqual(self._recorded[-1][2]["tool_input"]["reason"], "stale_nonce")
 
     def test_same_marketplace_classifier_requires_exact_generated_source(self):
         name = "experience-react"
@@ -4554,7 +5137,10 @@ class PluginInstallTelemetryTests(unittest.TestCase):
                 rc = sfx._cmd_plugin_install_decline("unknown-plugin", "sess-6")
             self.assertEqual(rc, 2)
             self.assertIn(expected, err.getvalue().lower())
-        self.assertEqual(self._recorded, [])
+        self.assertEqual(
+            [row[2]["tool_input"]["reason"] for row in self._recorded],
+            ["decline_refused"] * len(cases),
+        )
 
     def test_decline_refuses_when_no_prior_proposal(self):
         with mock.patch.object(sfx, "_plugin_install_lookup",
@@ -4563,7 +5149,8 @@ class PluginInstallTelemetryTests(unittest.TestCase):
             rc = sfx._cmd_plugin_install_decline("agentforce-adlc", "sess-7")
         self.assertEqual(rc, 2)
         self.assertIn("not proposed", err.getvalue().lower())
-        self.assertEqual(self._recorded, [])
+        self.assertEqual(self._recorded[-1][0], "plugin_install_result")
+        self.assertEqual(self._recorded[-1][2]["tool_input"]["reason"], "decline_refused")
 
     def test_decline_fires_event_and_persists_durable_declined_marker(self):
         sfx._save_plugin_proposals(
@@ -4574,12 +5161,15 @@ class PluginInstallTelemetryTests(unittest.TestCase):
             rc = sfx._cmd_plugin_install_decline("agentforce-adlc", "sess-8")
         self.assertEqual(rc, 0)
         self.assertIn("declined", out.getvalue().lower())
-        self.assertEqual(len(self._recorded), 1)
+        self.assertEqual(len(self._recorded), 2)
         event, _outcome, payload = self._recorded[0]
         self.assertEqual(event, "plugin_suggestion_declined")
         self.assertEqual(payload["tool_input"],
                           {"plugin": "agentforce-adlc", "origin": "external",
                            "confidence": "medium", "surface": "discovery-command"})
+        self.assertEqual(self._recorded[1][0], "plugin_install_result")
+        self.assertEqual(self._recorded[1][2]["tool_input"]["reason"], "declined")
+        # The entry survives (unchanged) so a later occurrence still dedupes to warn.
         # The entry survives so a later occurrence still dedupes to warn, and now
         # carries a durable "decision": "declined" marker so a bare "yes" issued
         # after the 24h flow TTL cannot re-arm an intentionally declined proposal.
@@ -4597,7 +5187,130 @@ class PluginInstallTelemetryTests(unittest.TestCase):
             rc = sfx._cmd_plugin_install_decline("agentforce-adlc", "sess-9")
         self.assertEqual(rc, 2)
         self.assertIn("malformed", err.getvalue().lower())
-        self.assertEqual(self._recorded, [])
+        self.assertEqual(self._recorded[-1][0], "plugin_install_result")
+        self.assertEqual(self._recorded[-1][2]["tool_input"]["reason"], "decline_refused")
+
+    # -- NL decline (UserPromptSubmit / cmd_orientation_paint) also reaches
+    # pluginInstall.completed. Per decision-log.md / plugin-catalog.md, natural-
+    # language decline is the PRIMARY decline path (the CLI --decline form above
+    # is only a compatibility path), so each of the four routing branches that
+    # call `_record_plugin_decline` directly must fire the same event the CLI
+    # wrapper does -- otherwise the event's declined/decline_refused reasons
+    # would badly undercount real declines.
+
+    def test_nl_decline_of_other_proposal_with_pending_install_fires_result(self):
+        session_id = "sess-nl-decline-1"
+        name = "experience-react"
+        entry = {"source": f"./plugins/builder/{name}", "origin": "local"}
+        self.assertTrue(sfx._save_plugin_proposals(
+            session_id, {name: {"confidence": "high", "surface": "user-prompt"}},
+        ))
+        # A different pending confirmation is in flight for another plugin.
+        self.assertTrue(sfx._save_plugin_install_pending(
+            session_id, "agentforce-adlc", "a" * 64,
+        ))
+        with mock.patch.object(
+                sfx, "_plugin_install_lookup", return_value=_plugin_lookup(entry)), \
+                redirect_stdout(io.StringIO()):
+            sfx.cmd_orientation_paint(
+                payload={
+                    "prompt": f"no thanks, do not install {name}",
+                    "session_id": session_id,
+                },
+                prompt_context=None,
+            )
+        self.assertEqual(self._recorded[-1][0], "plugin_install_result")
+        self.assertEqual(
+            self._recorded[-1][2]["tool_input"], {"plugin": name, "reason": "declined"},
+        )
+
+    def test_nl_generic_decline_of_pending_install_fires_result(self):
+        session_id = "sess-nl-decline-2"
+        name = "experience-react"
+        entry = {"source": f"./plugins/builder/{name}", "origin": "local"}
+        self.assertTrue(sfx._save_plugin_proposals(
+            session_id, {name: {"confidence": "high", "surface": "user-prompt"}},
+        ))
+        self.assertTrue(sfx._save_plugin_install_pending(session_id, name, "b" * 64))
+        with mock.patch.object(
+                sfx, "_plugin_install_lookup", return_value=_plugin_lookup(entry)), \
+                redirect_stdout(io.StringIO()):
+            sfx.cmd_orientation_paint(
+                payload={"prompt": "no thanks", "session_id": session_id},
+                prompt_context=None,
+            )
+        self.assertEqual(self._recorded[-1][0], "plugin_install_result")
+        self.assertEqual(
+            self._recorded[-1][2]["tool_input"], {"plugin": name, "reason": "declined"},
+        )
+
+    def test_nl_decline_without_pending_install_fires_result(self):
+        session_id = "sess-nl-decline-3"
+        name = "experience-react"
+        entry = {"source": f"./plugins/builder/{name}", "origin": "local"}
+        self.assertTrue(sfx._save_plugin_proposals(
+            session_id, {name: {"confidence": "high", "surface": "user-prompt"}},
+        ))
+        with mock.patch.object(
+                sfx, "_plugin_install_lookup", return_value=_plugin_lookup(entry)), \
+                redirect_stdout(io.StringIO()):
+            sfx.cmd_orientation_paint(
+                payload={
+                    "prompt": f"no thanks, do not install {name}",
+                    "session_id": session_id,
+                },
+                prompt_context=None,
+            )
+        self.assertEqual(self._recorded[-1][0], "plugin_install_result")
+        self.assertEqual(
+            self._recorded[-1][2]["tool_input"], {"plugin": name, "reason": "declined"},
+        )
+
+    def test_nl_generic_decline_of_flow_plugin_fires_result(self):
+        session_id = "sess-nl-decline-4"
+        name = "experience-react"
+        entry = {"source": f"./plugins/builder/{name}", "origin": "local"}
+        self.assertTrue(sfx._save_plugin_proposals(
+            session_id, {name: {"confidence": "high", "surface": "user-prompt"}},
+        ))
+        self.assertTrue(sfx._save_plugin_flow(
+            session_id, [name], selected=name, state="selected",
+            surface="user-prompt", task_backed=True,
+        ))
+        with mock.patch.object(
+                sfx, "_plugin_install_lookup", return_value=_plugin_lookup(entry)), \
+                redirect_stdout(io.StringIO()):
+            sfx.cmd_orientation_paint(
+                payload={"prompt": "no thanks", "session_id": session_id},
+                prompt_context=None,
+            )
+        self.assertEqual(self._recorded[-1][0], "plugin_install_result")
+        self.assertEqual(
+            self._recorded[-1][2]["tool_input"], {"plugin": name, "reason": "declined"},
+        )
+
+    def test_nl_decline_refusal_fires_decline_refused(self):
+        session_id = "sess-nl-decline-refused"
+        name = "experience-react"
+        self.assertTrue(sfx._save_plugin_proposals(
+            session_id, {name: {"confidence": "high", "surface": "user-prompt"}},
+        ))
+        with mock.patch.object(
+                sfx, "_plugin_install_lookup",
+                return_value=_plugin_lookup(reason="unknown")), \
+                redirect_stdout(io.StringIO()):
+            sfx.cmd_orientation_paint(
+                payload={
+                    "prompt": f"no thanks, do not install {name}",
+                    "session_id": session_id,
+                },
+                prompt_context=None,
+            )
+        self.assertEqual(self._recorded[-1][0], "plugin_install_result")
+        self.assertEqual(
+            self._recorded[-1][2]["tool_input"],
+            {"plugin": name, "reason": "decline_refused"},
+        )
 
 
 class PluginTrustedSourceGateTests(unittest.TestCase):
@@ -5062,6 +5775,11 @@ class PluginInstallMarketplaceRoutingTests(unittest.TestCase):
     source (agentforce-adlc) installs from the pre-registered official
     marketplace with no registration step."""
 
+    def setUp(self):
+        result_patch = mock.patch.object(sfx, "_fire_plugin_install_result")
+        self.result = result_patch.start()
+        self.addCleanup(result_patch.stop)
+
     def test_marketplace_name_is_salesforce_for_local_source(self):
         name = "experience-react"
         entry = {"source": f"./plugins/builder/{name}"}
@@ -5097,6 +5815,7 @@ class PluginInstallMarketplaceRoutingTests(unittest.TestCase):
                 mock.patch.object(sfx, "_load_plugin_flow", return_value=None), \
                 redirect_stdout(io.StringIO()):
             self.assertEqual(sfx._perform_plugin_install(name, entry, "sess-local"), 0)
+        self.result.assert_called_once_with("installed", "sess-local", name)
         reg.assert_called_once()
         argv = run_step.call_args_list[0].args[0]
         self.assertEqual(argv, ["claude", "plugin", "install", f"{name}@salesforce", "--yes"])
@@ -5118,6 +5837,7 @@ class PluginInstallMarketplaceRoutingTests(unittest.TestCase):
                 mock.patch.object(sfx, "_load_plugin_flow", return_value=None), \
                 redirect_stdout(io.StringIO()):
             self.assertEqual(sfx._perform_plugin_install(name, entry, "sess-external"), 0)
+        self.result.assert_called_once_with("installed", "sess-external", name)
         reg.assert_not_called()
         argv = run_step.call_args_list[0].args[0]
         self.assertEqual(
@@ -5134,6 +5854,7 @@ class PluginInstallMarketplaceRoutingTests(unittest.TestCase):
                 ), \
                 redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(sfx._perform_plugin_install(name, entry, "sess-fail"), 3)
+        self.result.assert_called_once_with("subprocess_failure", "sess-fail", name)
         err = stderr.getvalue()
         self.assertIn("claude-plugins-official", err)
         # The stale/unregistered remediation is wrong for the pre-registered
@@ -5153,6 +5874,7 @@ class PluginInstallMarketplaceRoutingTests(unittest.TestCase):
                 ), \
                 redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(sfx._perform_plugin_install(name, entry, "sess-fail"), 3)
+        self.result.assert_called_once_with("subprocess_failure", "sess-fail", name)
         err = stderr.getvalue()
         self.assertIn("salesforce", err)
         # `update` presumes the marketplace exists, so the unregistered case must
@@ -5440,7 +6162,7 @@ class DriveResumeDispatchTests(unittest.TestCase):
             mock.patch.object(sfx, "_enabled_plugin_names",
                               return_value={"salesforce-test-drive"}),
             mock.patch.object(sfx, "_plugin_match_sensitivity", return_value="standard"),
-            # No pending install / flow, and skip the ambient-rail tail so a
+            # No pending install / flow, and skip the ambient-nudge tail so a
             # fall-through turn ends fast and hermetically instead of shelling out.
             mock.patch.object(sfx, "_load_plugin_install_pending", return_value=None),
             mock.patch.object(sfx, "_load_plugin_flow", return_value=None),
@@ -5594,7 +6316,7 @@ class WelcomeTestDrivePointerTests(unittest.TestCase):
                                   return_value={sfx._TEST_DRIVE_PLUGIN_NAME}), \
                 mock.patch.object(sfx, "_open_plugin_flow") as opened, \
                 mock.patch.object(sfx, "_fire_plugin_telemetry_event") as fired:
-            result = sfx._welcome_test_drive_pointer("sess-inst", in_project=True)
+            result = sfx._welcome_test_drive_pointer("sess-inst")
         self.assertIsNone(result)
         opened.assert_not_called()
         fired.assert_not_called()
@@ -5607,7 +6329,7 @@ class WelcomeTestDrivePointerTests(unittest.TestCase):
                                   return_value={"unrelated"}), \
                 mock.patch.object(sfx, "_open_plugin_flow", return_value=True) as opened, \
                 mock.patch.object(sfx, "_fire_plugin_telemetry_event") as fired:
-            result = sfx._welcome_test_drive_pointer("sess-side-b", in_project=True)
+            result = sfx._welcome_test_drive_pointer("sess-side-b")
         self.assertIsNotNone(result)
         note, visible = result
         self.assertIn("Recommended plugin", visible)             # the compact rec header…
@@ -5641,26 +6363,12 @@ class WelcomeTestDrivePointerTests(unittest.TestCase):
                                   return_value={"unrelated"}), \
                 mock.patch.object(sfx, "_open_plugin_flow", return_value=True), \
                 mock.patch.object(sfx, "_fire_plugin_telemetry_event"):
-            result = sfx._welcome_test_drive_pointer("sess-wrap", in_project=True)
+            result = sfx._welcome_test_drive_pointer("sess-wrap")
         self.assertIsNotNone(result)
         _, visible = result
         self.assertIn("salesforce-test-drive", visible)   # the compact bullet renders…
         self.assertEqual(
             [l for l in visible.splitlines() if len(l) > 80], [])  # …and holds ≤80
-
-    def test_uninstalled_out_of_project_returns_none(self):
-        # Shape 2: the Side-A newcomer welcome never carries an install command.
-        module = self._catalog_module()
-        with mock.patch.object(sfx, "_load_plugin_catalog_module", return_value=module), \
-                mock.patch.object(sfx, "_enabled_plugin_names",
-                                  return_value=set()), \
-                mock.patch.object(sfx, "_open_plugin_flow") as opened, \
-                mock.patch.object(sfx, "_fire_plugin_telemetry_event") as fired:
-            result = sfx._welcome_test_drive_pointer("sess-side-a", in_project=False)
-        self.assertIsNone(result)
-        opened.assert_not_called()
-        fired.assert_not_called()
-        self.assertEqual(sfx._load_plugin_proposals("sess-side-a"), {})
 
     def test_already_in_ledger_is_deduped(self):
         module = self._catalog_module()
@@ -5672,7 +6380,7 @@ class WelcomeTestDrivePointerTests(unittest.TestCase):
                 mock.patch.object(sfx, "_enabled_plugin_names",
                                   return_value={sfx._TEST_DRIVE_PLUGIN_NAME}), \
                 mock.patch.object(sfx, "_fire_plugin_telemetry_event") as fired:
-            result = sfx._welcome_test_drive_pointer("sess-dedup", in_project=True)
+            result = sfx._welcome_test_drive_pointer("sess-dedup")
         self.assertIsNone(result)
         fired.assert_not_called()
         # The prior entry (surface session-start) is untouched — not overwritten.
@@ -5688,23 +6396,21 @@ class WelcomeTestDrivePointerTests(unittest.TestCase):
                 mock.patch.object(sfx, "_enabled_plugin_names",
                                   return_value={sfx._TEST_DRIVE_PLUGIN_NAME}):
             self.assertIsNone(
-                sfx._welcome_test_drive_pointer("sess-off", in_project=True))
+                sfx._welcome_test_drive_pointer("sess-off"))
 
     def test_unconfirmable_enabled_set_is_treated_as_uninstalled(self):
-        # enabled is None (unreadable) never counts as installed: in-project it
-        # proposes an install, out-of-project it stays silent.
+        # enabled is None (unreadable) never counts as installed: it proposes an
+        # install rather than staying silent.
         module = self._catalog_module()
         with mock.patch.object(sfx, "_load_plugin_catalog_module", return_value=module), \
                 mock.patch.object(sfx, "_enabled_plugin_names", return_value=None), \
                 mock.patch.object(sfx, "_open_plugin_flow", return_value=True), \
                 mock.patch.object(sfx, "_fire_plugin_telemetry_event"):
-            in_proj = sfx._welcome_test_drive_pointer("sess-none-b", in_project=True)
-            out_proj = sfx._welcome_test_drive_pointer("sess-none-a", in_project=False)
-        self.assertIsNotNone(in_proj)
+            result = sfx._welcome_test_drive_pointer("sess-none-b")
+        self.assertIsNotNone(result)
         # Uninstalled → an install proposal: the install command rides the note.
         self.assertIn(
-            "/salesforce-development:plugin-install salesforce-test-drive", in_proj[0])
-        self.assertIsNone(out_proj)
+            "/salesforce-development:plugin-install salesforce-test-drive", result[0])
 
     def test_missing_catalog_row_returns_none(self):
         module = self._catalog_module(include_row=False)
@@ -5712,7 +6418,7 @@ class WelcomeTestDrivePointerTests(unittest.TestCase):
                 mock.patch.object(sfx, "_enabled_plugin_names",
                                   return_value={sfx._TEST_DRIVE_PLUGIN_NAME}):
             self.assertIsNone(
-                sfx._welcome_test_drive_pointer("sess-norow", in_project=True))
+                sfx._welcome_test_drive_pointer("sess-norow"))
 
     def test_no_session_id_paints_but_does_not_persist(self):
         # Uninstalled + in-project paints an install rec; without a session id it
@@ -5722,7 +6428,7 @@ class WelcomeTestDrivePointerTests(unittest.TestCase):
                 mock.patch.object(sfx, "_enabled_plugin_names",
                                   return_value={"unrelated"}), \
                 mock.patch.object(sfx, "_fire_plugin_telemetry_event") as fired:
-            result = sfx._welcome_test_drive_pointer("", in_project=True)
+            result = sfx._welcome_test_drive_pointer("")
         self.assertIsNotNone(result)
         fired.assert_not_called()
 
@@ -5736,7 +6442,7 @@ class WelcomeTestDrivePointerTests(unittest.TestCase):
                                   return_value={"unrelated"}), \
                 mock.patch.object(sfx, "_open_plugin_flow", return_value=False), \
                 mock.patch.object(sfx, "_fire_plugin_telemetry_event") as fired:
-            result = sfx._welcome_test_drive_pointer("sess-flowfail", in_project=True)
+            result = sfx._welcome_test_drive_pointer("sess-flowfail")
         self.assertIsNone(result)
         fired.assert_not_called()
         self.assertNotIn(sfx._TEST_DRIVE_PLUGIN_NAME,
@@ -5752,7 +6458,7 @@ class WelcomeTestDrivePointerTests(unittest.TestCase):
                 mock.patch.object(sfx, "_save_plugin_proposals", return_value=False), \
                 mock.patch.object(sfx, "_open_plugin_flow", return_value=True) as opened, \
                 mock.patch.object(sfx, "_fire_plugin_telemetry_event") as fired:
-            result = sfx._welcome_test_drive_pointer("sess-ledgerfail", in_project=True)
+            result = sfx._welcome_test_drive_pointer("sess-ledgerfail")
         self.assertIsNone(result)
         opened.assert_not_called()
         fired.assert_not_called()
@@ -5906,12 +6612,16 @@ class ArmOverviewTestDriveProposalTests(unittest.TestCase):
 
 
 class WelcomeTestDriveWiringTests(unittest.TestCase):
-    """`cmd_orientation_paint` folds the pointer onto BOTH welcome surfaces — the
-    Side-B in-project orientation welcome (call site 1) and the Side-A out-of-
-    project getting-started welcome — routing the visible half to `systemMessage`
-    and the model half to `additionalContext`. The pointer itself is mocked to a
-    sentinel so this test isolates the WIRING (folding + in_project arg), not the
-    helper's install-state logic (covered above)."""
+    """`cmd_orientation_paint` folds the pointer onto the Side-B in-project
+    orientation welcome (call site 1), routing the visible half to `systemMessage`
+    and the model half to `additionalContext`. (The Side-A out-of-project
+    getting-started welcome this class used to also cover was demoted to a
+    model-facing-only note with no rendered surface at all — entered-project-splash
+    plan, Change 2 — so the pointer-folding wiring at that call site no longer
+    exists; see `GettingStartedWelcomeTests` in test_discovery_runtime.py for its
+    current model-facing-only coverage.) The pointer itself is mocked to a sentinel
+    so this test isolates the WIRING (folding + call arguments), not the helper's
+    install-state logic (covered above)."""
 
     _PTR = ("MODEL_PTR_SENTINEL", "VISIBLE_PTR_SENTINEL")
 
@@ -5926,14 +6636,14 @@ class WelcomeTestDriveWiringTests(unittest.TestCase):
             mock.patch.object(sfx, "_plugin_catalog_match", return_value=[]),
             mock.patch.object(sfx, "_plugin_match_sensitivity", return_value="standard"),
             mock.patch.object(sfx, "_welcomed_this_session", return_value=False),
-            mock.patch.object(sfx, "_prompt_rail_allowed", return_value=True),
+            mock.patch.object(sfx, "_prompt_nudge_allowed", return_value=True),
             mock.patch.object(sfx, "_banner_color_enabled", return_value=False),
             mock.patch.object(sfx, "_render_getting_started_welcome",
                               return_value="WELCOME_BODY"),
             # Silence the side-effecting session-marker writers.
             mock.patch.object(sfx, "_record_welcomed"),
             mock.patch.object(sfx, "_record_entered"),
-            mock.patch.object(sfx, "_record_rail_signature"),
+            mock.patch.object(sfx, "_record_nudge_shown"),
         ]
         for patch in patches:
             patch.start()
@@ -5959,22 +6669,36 @@ class WelcomeTestDriveWiringTests(unittest.TestCase):
         self.assertIn("VISIBLE_PTR_SENTINEL", result["systemMessage"])
         self.assertIn("MODEL_PTR_SENTINEL",
                       result["hookSpecificOutput"]["additionalContext"])
-        self.assertTrue(pointer.call_args.kwargs["in_project"])
+        self.assertEqual(pointer.call_args.args[0], "sess-wire")
 
-    def test_side_a_getting_started_welcome_folds_pointer(self):
-        bare = Path(self._tmp.name) / "bare"
-        bare.mkdir()
-        os.chdir(bare)
-        with mock.patch.object(sfx, "_resolve_welcome_org", return_value={}), \
-                mock.patch.object(sfx, "_ambient_surface",
-                                  side_effect=lambda surface, *a, **k: surface), \
-                mock.patch.object(sfx, "_welcome_test_drive_pointer",
-                                  return_value=self._PTR) as pointer:
-            result = self._dispatch("I'm new to Salesforce, how do I begin")
-        self.assertIn("VISIBLE_PTR_SENTINEL", result["systemMessage"])
-        self.assertIn("MODEL_PTR_SENTINEL",
-                      result["hookSpecificOutput"]["additionalContext"])
-        self.assertFalse(pointer.call_args.kwargs["in_project"])
+
+class ProjectTypeFromDescriptorTests(unittest.TestCase):
+    """_project_type_from_descriptor reads sfdx-project.json's TOP-LEVEL `template`
+    key defensively — every missing/blank/malformed shape (this file is user-editable)
+    falls back to None. The key is written by the scaffold hook when it observed
+    `sf project generate`; a project we did not generate has no type. The function's
+    contract is dict-in (the caller guards non-dict descriptors upstream)."""
+
+    def test_present_and_valid(self):
+        self.assertEqual(sfx._project_type_from_descriptor({"template": "standard"}), "standard")
+
+    def test_whitespace_trimmed(self):
+        self.assertEqual(sfx._project_type_from_descriptor({"template": "  agent  "}), "agent")
+
+    def test_missing_template_key(self):
+        self.assertIsNone(sfx._project_type_from_descriptor({"name": "Project"}))
+
+    def test_non_string_template(self):
+        self.assertIsNone(sfx._project_type_from_descriptor({"template": 42}))
+
+    def test_empty_string_template(self):
+        self.assertIsNone(sfx._project_type_from_descriptor({"template": ""}))
+
+    def test_blank_string_template(self):
+        self.assertIsNone(sfx._project_type_from_descriptor({"template": "   "}))
+
+    def test_empty_descriptor(self):
+        self.assertIsNone(sfx._project_type_from_descriptor({}))
 
 
 if __name__ == "__main__":

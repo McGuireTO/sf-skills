@@ -7,12 +7,51 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-- We're working to trim down the number of skills in the salesforce-development plugin
-  to provide more context for additional plugins and skills. As part of this effort, we're
-  also reducing the size of skill descriptions without sacrificing effectiveness.
+## [2.2.0] — 2026-09-21
 
-- We're working on an easy way to provide feedback on this plugin to continually improve the
-  development experience.
+### Added
+
+- **Four new development capabilities:** create Custom Metadata Types and Custom Settings with
+  the correct metadata shapes, manage org data from record creation through bulk import/export
+  and cleanup, and verify standard-object and Tooling API fields against a bundled schema
+  reference before writing queries or Apex.
+- **In-chat plugin feedback.** Run `/salesforce-development:feedback` to record a 1–5 satisfaction
+  rating. The command checks whether telemetry is enabled before asking, records only the numeric
+  rating, and always points to GitHub Issues for detailed feedback.
+
+### Changed
+
+- The session journey display now chooses one actionable, confidence-ranked hint instead of
+  drawing the former glyph rail. Hints distinguish urgent fixes, risks, useful next steps, and
+  optional cleanup; account for scratch-org expiry, project templates, test failures, and recent
+  scaffolding; and avoid repeating unchanged guidance during the same session.
+- Presentation mode and plugin-recommendation settings now appear as selectable configuration
+  options. Presentation modes are `full`, accessible semantic `plain`, and `off`; the former
+  `compact` mode has been retired.
+- Reduced the core plugin's eagerly loaded context by moving specialized skills into companion
+  plugins and shortening skill descriptions while preserving their discovery effectiveness.
+
+### Fixed
+
+- Freshly scaffolded projects now receive framework-aware build guidance instead of premature
+  deploy or test advice, including support for composed shell commands and the canonical
+  `sf template generate project` command.
+- Salesforce CLI update notices now compare against the version actually running, so a completed
+  auto-update is no longer reported as still pending.
+- A temporarily unreachable org remains visible as a connectivity warning even after the project
+  journey has advanced beyond the Connect stage.
+
+### Removed
+
+- **Code-quality capabilities moved to a new `salesforce-code-quality` plugin.** The Code
+  Analyzer skills (`dx-code-analyzer-run`, `dx-code-analyzer-configure`,
+  `dx-code-analyzer-custom-rule-create`), the `platform-architecture-analyze`
+  Well-Architected review skill, and the read-only `architecture-review` agent are no longer
+  part of this plugin — they now ship in the standalone `salesforce-code-quality` plugin.
+  Install that plugin to keep static analysis, custom-rule authoring, and Well-Architected
+  review available. This is a packaging move rather than the end of support for those
+  capabilities, so it ships as part of this minor release while trimming the eagerly-loaded
+  skill-listing footprint of the core plugin.
 
 ## [2.1.1] — 2026-09-04
 

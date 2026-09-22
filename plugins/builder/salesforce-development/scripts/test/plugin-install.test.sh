@@ -52,10 +52,13 @@ MEDIUM_PROMPT="curious about agentforce for this"
 STUBDIR=$(mktemp -d)
 STUB_LOG="$STUBDIR/claude-calls.log"
 HERMETIC_CONFIG=$(mktemp -d)
+HERMETIC_PROJECT=$(mktemp -d)
 printf '{"enabledPlugins":{"salesforce-development@salesforce":true}}' \
   > "$HERMETIC_CONFIG/settings.json"
+printf '{"packageDirectories":[],"sourceApiVersion":"66.0"}' \
+  > "$HERMETIC_PROJECT/sfdx-project.json"
 export CLAUDE_CONFIG_DIR="$HERMETIC_CONFIG"
-trap 'rm -rf "$STUBDIR" "$HERMETIC_CONFIG"' EXIT
+trap 'rm -rf "$STUBDIR" "$HERMETIC_CONFIG" "$HERMETIC_PROJECT"' EXIT
 
 write_stub() {
   # write_stub <exit-code>
@@ -94,6 +97,12 @@ capture_prompt() {
   printf '{"session_id":"%s","prompt_id":"%s","prompt":"%s"}' "$1" "$2" "$3" \
     | "$CTX" prompt-dispatch >/dev/null
 }
+
+# UserPromptSubmit recommendations and the bypass advisory are intentionally
+# project-scoped. Run the gate from a hermetic Salesforce project so these tests
+# exercise their real production eligibility boundary instead of depending on
+# the repository checkout's working directory.
+cd "$HERMETIC_PROJECT"
 
 echo "sf-context plugin-install — decision (offline, no org, claude stubbed)"
 

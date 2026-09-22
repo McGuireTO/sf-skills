@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Release documentation and design-link contracts for plugin 2.1.1."""
+"""Release documentation and design-link contracts for plugin 2.2.0."""
 from __future__ import annotations
 
 import json
@@ -25,10 +25,10 @@ class DocumentationContractTests(unittest.TestCase):
 
     def test_release_version_minimum_and_changelog_are_reconciled(self):
         plugin = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "2.1.1")
+        self.assertEqual(plugin["version"], "2.2.0")
         readme = self.text(README)
         self.assertIn("Claude Code 2.1.222 or later", readme)
-        self.assertIn("## [2.1.1]", self.text(CHANGELOG))
+        self.assertIn("## [2.2.0]", self.text(CHANGELOG))
 
     def test_current_docs_share_the_six_stage_contract(self):
         paths = [README, DESIGN / "README.md", DESIGN / "headless-360-pov.md",
@@ -47,7 +47,7 @@ class DocumentationContractTests(unittest.TestCase):
 
     def test_configuration_doc_documents_modes_and_no_color(self):
         text = self.text(CONFIG_DOC)
-        for mode in ("`full`", "`compact`", "`plain`", "`off`"):
+        for mode in ("`full`", "`plain`", "`off`"):
             self.assertIn(mode, text)
         self.assertIn("CLAUDE_PLUGIN_OPTION_UI_MODE", text)
         self.assertIn("NO_COLOR", text)

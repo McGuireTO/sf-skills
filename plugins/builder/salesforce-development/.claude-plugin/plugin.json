@@ -1,7 +1,7 @@
 {
   "name": "salesforce-development",
   "displayName": "Salesforce Development",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "description": "Build Salesforce apps and agents using these core building blocks: metadata, Apex, deploy/retrieve, security, reporting, and generated installed-versus-available capability discovery.",
   "author": { "name": "Salesforce", "url": "https://github.com/forcedotcom/sf-skills" },
   "license": "Apache-2.0",
@@ -12,14 +12,16 @@
   "userConfig": {
     "ui_mode": {
       "type": "string",
-      "title": "Salesforce development UI mode",
-      "description": "Ambient UI: full (default), compact, plain semantic text, or off. Explicit commands and safety guidance remain available.",
+      "title": "Presentation mode",
+      "description": "Ambient UI: full (default) signature banner and rail, plain accessible semantic text (no color or glyphs), or off. Explicit commands and safety guidance remain available in every mode.",
+      "options": ["full", "plain", "off"],
       "default": "full"
     },
     "plugin_match_sensitivity": {
       "type": "string",
-      "title": "Uninstalled-plugin recommendation sensitivity",
-      "description": "How readily this plugin proposes an uninstalled Salesforce plugin matching your task: off (never), low, standard (default), high, or a custom number from 1.0-10.0. Change it any time from within a session with /salesforce-development:plugin-recommendations.",
+      "title": "Plugin recommendation",
+      "description": "How readily this plugin proposes an uninstalled Salesforce plugin matching your task: off (never), low, standard (default), or high. For a custom numeric threshold (1.0-10.0), set it from within a session with /salesforce-development:plugin-recommendations.",
+      "options": ["off", "low", "standard", "high"],
       "default": "standard"
     }
   },
@@ -46,6 +48,11 @@
       {
         "matcher": "Bash",
         "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(sf *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/sf-context cli-update-notice"
+          },
           {
             "type": "command",
             "if": "Bash(sf project deploy *)",
@@ -119,6 +126,11 @@
           {
             "type": "command",
             "if": "Bash(sf project generate*)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/sf-context scaffold-gate"
+          },
+          {
+            "type": "command",
+            "if": "Bash(sf template generate project*)",
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/sf-context scaffold-gate"
           }
         ]
@@ -241,6 +253,11 @@
             "type": "command",
             "if": "Bash(sf project deploy *)",
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/sf-context post-deploy-failure"
+          },
+          {
+            "type": "command",
+            "if": "Bash(sf apex run test *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/sf-context post-test-failure"
           },
           {
             "type": "command",

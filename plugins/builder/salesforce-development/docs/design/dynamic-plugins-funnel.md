@@ -1,0 +1,186 @@
+# Dynamic Plugins funnel telemetry
+
+This is the analytics contract for W-24163509. It keeps the producer's established
+`command.invoked` shape intact and defines one consistent recommend-to-install funnel for the
+dashboard.
+
+## Definitions
+
+- **Headline recommendations:** unique `(plugin, session)` recommendations that were likely shown.
+  A medium-confidence `bypass-gate` event is a soft advisory that often never reaches the visible
+  user surface, so it is excluded from this headline.
+- **Soft advisories:** unique `(plugin, session)` medium-confidence `bypass-gate` recommendations.
+  Show this as a separate diagnostic tile, not as part of the headline numerator.
+- **Installs:** unique `(plugin, session)` `plugin.installed` events. This remains designed-path
+  conversion; out-of-band installs are not inferred.
+- **Conversion:** unique installs divided by unique shown recommendations. Use the same distinct key
+  in the headline and every surface/plugin breakdown.
+- **Raw events:** a diagnostic volume only. If retained, label the tile **Raw recommendation
+  events**; never label it unique.
+
+The recommended dashboard label is **Unique plugin-session recommendations shown**. It matches the
+deduplicated query and describes the metric more usefully than preserving the old near-raw value.
+
+## Producer result reasons
+
+`pluginInstall.completed` has the catalog-validated plugin name as `componentId`,
+`contextName = 'reason'`, and one of these fixed `contextValue` values. When the input cannot be
+validated against the catalog, `componentId` is the fixed sentinel `unknown`; caller-supplied text
+never reaches telemetry.
+
+| Class | Reasons |
+| --- | --- |
+| Completed | `installed`, `previewed`, `declined` |
+| No install attempt | `usage_error`, `invalid_name`, `catalog_unreadable`, `unknown_plugin`, `self_plugin`, `already_installed`, `decline_refused`, `proposal_not_selected` |
+| Retryable confirmation | `stale_nonce` |
+| Genuine install failure | `subprocess_failure` |
+
+Only `subprocess_failure` is the actual `claude plugin install` failure signal. The existing
+`command.invoked` `outcome = 'failure'` remains a nonzero-exit signal for backwards compatibility.
+
+## Correct nested-message projection
+
+Always bound `ts_date` in the innermost scan. `_userPayloadData` contains `message` as a JSON string,
+so fields require two `JSON_EXTRACT_SCALAR` calls. Event names are emitter-prefixed and must be
+reduced to their final segment.
+
+```sql
+WITH source_events AS (
+  SELECT
+    rawtimestamp,
+    ts_date,
+    TRY(JSON_EXTRACT_SCALAR(_userPayloadData, '$.message')) AS message_json
+  FROM uip_iceberg.coreapplogs_v4t.uxlog_view
+  WHERE ts_date >= '<START_YYYYMMDD>'
+    AND _userPayloadSchemaName = 'sf.a4dInstrumentation.A4dInstrumentation'
+    AND _userPayloadData LIKE '%salesforce-development/%'
+),
+events AS (
+  SELECT
+    rawtimestamp,
+    REGEXP_EXTRACT(
+      TRY(JSON_EXTRACT_SCALAR(message_json, '$.eventName')), '[^/]+$'
+    ) AS event_name,
+    TRY(JSON_EXTRACT_SCALAR(message_json, '$.session_Id')) AS session_id,
+    TRY(JSON_EXTRACT_SCALAR(message_json, '$.componentId')) AS component_id,
+    TRY(JSON_EXTRACT_SCALAR(message_json, '$.contextName')) AS context_name,
+    TRY(JSON_EXTRACT_SCALAR(message_json, '$.contextValue')) AS context_value,
+    TRY(JSON_EXTRACT_SCALAR(message_json, '$.skillSource')) AS skill_source
+  FROM source_events
+),
+lifecycle AS (
+  SELECT
+    event_name,
+    session_id,
+    component_id AS plugin,
+    SPLIT_PART(context_value, '::', 2) AS confidence,
+    SPLIT_PART(context_value, '::', 3) AS surface
+  FROM events
+  WHERE skill_source = 'salesforce-development'
+    AND event_name IN ('plugin.recommended', 'plugin.installed')
+    AND context_name = 'origin::confidence::surface'
+)
+SELECT event_name, COUNT(*) AS raw_events
+FROM lifecycle
+GROUP BY 1
+ORDER BY 1;
+```
+
+Do not use quoted-fragment `LIKE` tests against `_userPayloadData`; its inner quotes are escaped.
+For a cheap existence check, match an unquoted fragment such as `%pluginInstall.completed%`.
+
+## Headline and shown-versus-counted split
+
+Append these CTEs to the projection above:
+
+```sql
+, recommendation_observations AS (
+  SELECT DISTINCT
+    plugin,
+    session_id,
+    confidence,
+    surface,
+    CASE
+      WHEN surface = 'bypass-gate' AND confidence = 'medium' THEN 'soft_advisory'
+      ELSE 'shown'
+    END AS visibility
+  FROM lifecycle
+  WHERE event_name = 'plugin.recommended'
+), recommendation_keys AS (
+  SELECT
+    plugin,
+    session_id,
+    CASE
+      WHEN COUNT_IF(visibility = 'shown') > 0 THEN 'shown'
+      ELSE 'soft_advisory'
+    END AS visibility
+  FROM recommendation_observations
+  GROUP BY 1, 2
+), surface_recommendation_keys AS (
+  SELECT DISTINCT plugin, session_id, surface
+  FROM recommendation_observations
+  WHERE visibility = 'shown'
+), install_keys AS (
+  SELECT DISTINCT plugin, session_id, surface
+  FROM lifecycle
+  WHERE event_name = 'plugin.installed'
+), shown_install_keys AS (
+  SELECT DISTINCT i.plugin, i.session_id
+  FROM install_keys i
+  JOIN recommendation_keys r
+    ON r.plugin = i.plugin
+   AND r.session_id = i.session_id
+   AND r.visibility = 'shown'
+)
+SELECT
+  COUNT_IF(visibility = 'shown') AS unique_plugin_sessions_shown,
+  COUNT_IF(visibility = 'soft_advisory') AS unique_plugin_sessions_soft_advisory,
+  (SELECT COUNT(*) FROM shown_install_keys) AS unique_shown_installs,
+  1.0 * (SELECT COUNT(*) FROM shown_install_keys)
+    / NULLIF(COUNT_IF(visibility = 'shown'), 0) AS shown_to_install_ratio
+FROM recommendation_keys;
+```
+
+The ratio is intentionally returned on a 0–1 scale. In Superset, format it with `,.1%`; do not
+also multiply it by 100 in SQL.
+
+## Per-surface funnel
+
+The install event recovers the proposal surface before the proposal marker is cleared. Keep
+`self-directed` installs separate because they have no recommendation denominator.
+
+```sql
+SELECT
+  r.surface,
+  COUNT(*) AS unique_plugin_sessions_shown,
+  COUNT(i.plugin) AS unique_plugin_sessions_installed,
+  1.0 * COUNT(i.plugin) / NULLIF(COUNT(*), 0) AS conversion_ratio
+FROM surface_recommendation_keys r
+LEFT JOIN install_keys i
+  ON i.plugin = r.plugin
+ AND i.session_id = r.session_id
+ AND i.surface = r.surface
+GROUP BY 1
+ORDER BY 1;
+```
+
+For the plugin-by-surface view, add `r.plugin` to the select and group by both dimensions.
+
+## Install result validation
+
+After the producer version is deployed, validate the closed vocabulary with:
+
+```sql
+SELECT component_id AS plugin, context_value AS reason, COUNT(*) AS invocations
+FROM events
+WHERE skill_source = 'salesforce-development'
+  AND event_name = 'pluginInstall.completed'
+  AND context_name = 'reason'
+GROUP BY component_id, context_value
+ORDER BY component_id, invocations DESC;
+```
+
+The result must contain only the documented vocabulary. Report subprocess install-attempt failure
+rate as `subprocess_failure / (subprocess_failure + installed)`; previews and refusals never launch
+the install subprocess and therefore do not belong in that denominator. Do not derive this rate
+from nonzero `command.invoked` rows.

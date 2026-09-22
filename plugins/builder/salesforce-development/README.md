@@ -56,7 +56,7 @@ Once you're all set up, use natural language to describe what you want to do; th
 
 ## What's Included
 
-### 38 Skills
+### 37 Skills
 
 | Area | Skills |
 |------|--------|
@@ -65,22 +65,28 @@ Once you're all set up, use natural language to describe what you want to do; th
 | **Project and org lifecycle** | `dx-project-create` — Scaffold a new Salesforce DX project from scratch (template → generate → relocate → auth → default → source tracking); `dx-org-manage` — Create scratch orgs, take org snapshots, open orgs in the browser |
 | **Apex** | `platform-apex-generate`, `platform-apex-anonymous-run` (anonymous Apex + debug-log capture), `platform-apex-test-generate`, `platform-apex-test-run`, `platform-apex-logs-debug` |
 | **Automation** | `automation-flow-generate` — Screen, Autolaunched, Record-Triggered, and Scheduled Flows |
-| **Declarative metadata** | `platform-custom-object-generate`, `platform-custom-field-generate`, `platform-custom-application-generate`, `platform-custom-tab-generate`, `platform-custom-report-type-generate`, `platform-list-view-generate`, `platform-value-set-generate`, `platform-validation-rule-generate`, `platform-flexipage-generate`, `platform-lightning-app-coordinate` |
-| **Data** | `platform-soql-query` — SOQL/SOSL authoring, optimization, and query-plan analysis |
+| **Declarative metadata** | `platform-custom-object-generate`, `platform-custom-field-generate`, `platform-custom-metadata-type-generate`, `platform-custom-setting-generate`, `platform-custom-application-generate`, `platform-custom-tab-generate`, `platform-custom-report-type-generate`, `platform-list-view-generate`, `platform-value-set-generate`, `platform-validation-rule-generate`, `platform-flexipage-generate`, `platform-lightning-app-coordinate` |
+| **Data and API context** | `platform-data-manage` — Create, update, delete, import, export, seed, and clean up org records; `platform-soql-query` — SOQL/SOSL authoring, optimization, and query-plan analysis; `platform-data-and-tooling-api-context-get` — Standard-object and Tooling API field/schema reference |
 | **Deploy and retrieve** | `platform-metadata-deploy`, `platform-metadata-retrieve`, `platform-manifest-generate` (build `package.xml` / `destructiveChanges.xml`), `platform-metadata-api-context-get`, `platform-deploy-validate`, `platform-quick-deploy`, `platform-destructive-deploy` |
 | **Security** | `platform-permission-set-generate`, `platform-sharing-owd-configure`, `platform-sharing-rules-generate` |
-| **Code quality** | `dx-code-analyzer-run` — Run Code Analyzer (PMD/sfge/ESLint/RetireJS) and triage findings; `dx-code-analyzer-configure` — Author `code-analyzer.yml` + CI wiring; `dx-code-analyzer-custom-rule-create` — Author custom PMD/regex/ESLint rules; `platform-architecture-analyze` — Well-Architected review across Trusted / Easy / Adaptable |
 | **Reporting** | `platform-report-generate` |
 | **LSP** | `platform-lsp-integrate` — Contract and fallbacks for the bundled language-server tools |
 
 ### What Else Is in the Box
 
-- **Agents** — `salesforce-dev`, the primary Salesforce development agent (activates automatically in Salesforce projects — `sfdx-project.json` present — and routes requests skills-first, then SF CLI, then direct API as a last resort); and `architecture-review`, a read-only Well-Architected reviewer that grades a project against the Trusted / Easy / Adaptable pillars and hands back a pillar-scored report plus a governance checklist.
-- **Slash commands** — `/salesforce-development:discover` (computed public-channel capability overview/drilldown, `plugins <text>` for on-demand uninstalled-plugin matching, and optional on-demand `features [--target-org <alias>] [--refresh] [--json]`), `:plugin-install` (one-confirmation install for a trusted same-session marketplace recommendation; source confirmation for external plugins), `:plugin-recommendations` (view or change how readily uninstalled plugins get proposed), `:telemetry`, `:setup`, `:status`, `:org`, `:login`, `:logout`, `:set-default`, `:project`, `:reset-source-tracking`, `:welcome`.
+- **Agents** — `salesforce-dev`, the primary Salesforce development agent (activates automatically in Salesforce projects — `sfdx-project.json` present — and routes requests skills-first, then SF CLI, then direct API as a last resort). Code-analysis and Well-Architected review — the `dx-code-analyzer-*` skills, `platform-architecture-analyze`, and the read-only `architecture-review` agent — now live in the separate **salesforce-code-quality** plugin.
+- **Slash commands** — `/salesforce-development:discover` (computed public-channel capability overview/drilldown, `plugins <text>` for on-demand uninstalled-plugin matching, and optional on-demand `features [--target-org <alias>] [--refresh] [--json]`), `:plugin-install` (one-confirmation install for a trusted same-session marketplace recommendation; source confirmation for external plugins), `:plugin-recommendations` (view or change how readily uninstalled plugins get proposed), `:telemetry`, `:setup`, `:status`, `:org`, `:login`, `:logout`, `:set-default`, `:project`, `:reset-source-tracking`, `:welcome`, `:feedback` (manual-only — see [Feedback](#-feedback) below).
 - **MCP servers** — `salesforce-api-context` and `salesforce-metadata-experts` (API/metadata guidance), and `salesforce-lsp`, a local host that lazily spawns the **Apex** and **SOQL** language servers and exposes their semantic capabilities as MCP tools. See the `platform-lsp-integrate` skill for the tool contract.
 - **Hooks** — org-context detection on session start; a production deploy-safety gate and an Apex pre-deploy diagnostics gate on `sf project deploy`; and skills-first advisories that, when no installed skill matches, also propose an uninstalled plugin whose curated description does.
 
 Your progress through **Connect → Project → Build → Test → Deploy → Observe** is tracked from real, successful actions in your project — never assumed. Run `/salesforce-development:discover journey inspect` to review it, or `journey reset` to clear it.
+
+## 💬 Feedback
+
+Run `/salesforce-development:feedback` any time to tell us how things are going. It's a manual-only
+command (it never shows up in the model's own suggestions) that asks a single 1-5 satisfaction
+question right in chat and records it as a local telemetry event — the only thing that leaves your
+machine is that numeric rating, tagged the same coarse way as every other telemetry event.
 
 ## More Information
 

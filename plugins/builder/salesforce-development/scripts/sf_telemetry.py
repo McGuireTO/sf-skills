@@ -300,8 +300,8 @@ _ALLOWLIST = {
     "session_start": {"is_first_run"},
     "session_end": {"duration_ms", "event_count"},
     "command_invoked": {"outcome", "binary", "category", "subcommand"},
-    "skill_dispatched": {"skill", "skill_domain"},
-    "agent_dispatched": {"agent_type"},
+    "skill_dispatched": {"skill", "skill_domain", "subject_plugin"},
+    "agent_dispatched": {"agent_type", "subject_plugin"},
     "exception": {"error_class", "kind"},
     "mcp_tool_used": {"mcp_server", "mcp_tool", "outcome"},
     # plugin_loaded / plugin_suggestion_declined: the accept/decline halves of the
@@ -320,7 +320,33 @@ _ALLOWLIST = {
     # proposal.
     "plugin_recommended": {"plugin", "origin", "confidence", "surface"},
     "plugin_installed": {"plugin", "origin", "confidence", "surface"},
+    # Terminal result of one `sf-context plugin-install` invocation. The event
+    # carries a catalog-validated plugin name (or the fixed `unknown` sentinel)
+    # plus a fixed reason vocabulary emitted by the command's own return branches.
+    # It complements
+    # (rather than reshaping) command.invoked, whose established
+    # outcome::category tuple must remain backwards-compatible.
+    "plugin_install_result": {"plugin", "reason"},
+    # feedback: /feedback's structured signal -- rating (int 1-5) only. Never a
+    # free-text key; see capture_event's `feedback` branch.
+    "feedback": {"rating"},
 }
+
+_PLUGIN_INSTALL_REASONS = frozenset({
+    "installed",
+    "previewed",
+    "declined",
+    "usage_error",
+    "invalid_name",
+    "catalog_unreadable",
+    "unknown_plugin",
+    "self_plugin",
+    "already_installed",
+    "decline_refused",
+    "proposal_not_selected",
+    "stale_nonce",
+    "subprocess_failure",
+})
 
 # `error_class` is the one user-influenced value that reaches the wire (PDP componentId
 # + UIP attributes), so it is scrubbed on the way out. Claude Code's StopFailure hook
@@ -890,7 +916,7 @@ def _resolve_sf_skill(skill: str) -> tuple:
 # directory (self-maintaining), with a small built-in fallback vocabulary for when
 # the dir can't be read.
 _SF_AGENTS_FALLBACK = frozenset({
-    "architecture-review", "salesforce-dev",
+    "salesforce-dev",
 })
 _SF_AGENTS_CACHE: Optional[set] = None
 
@@ -1237,12 +1263,30 @@ def _write_session_end(payload: dict) -> None:
             duration_ms = max(0, _now_ms() - int(start))
     except (OSError, json.JSONDecodeError, ValueError):
         pass
-    # This session's buffer holds only this session's records, so event_count is
-    # simply its non-blank lines.
+    # Preserve the legacy Salesforce Development event-volume semantic: newly
+    # observed catalog-plugin dispatches are buffered and transmitted, but do not
+    # increase session.ended.event_count. Existing/malformed rows retain the old
+    # behavior and count as one non-blank line.
     event_count = 0
     try:
         with _session_buffer(sid).open(encoding="utf-8") as fh:
-            event_count = sum(1 for line in fh if line.strip())
+            for line in fh:
+                if not line.strip():
+                    continue
+                counts_toward_legacy_volume = True
+                try:
+                    buffered = json.loads(line)
+                    buffered_payload = buffered.get("payload", {})
+                    subject_plugin = (buffered_payload.get("subject_plugin", "")
+                                      if isinstance(buffered_payload, dict) else "")
+                    if (buffered.get("event") in ("skill_dispatched", "agent_dispatched")
+                            and subject_plugin
+                            and subject_plugin != "salesforce-development"):
+                        counts_toward_legacy_volume = False
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                if counts_toward_legacy_volume:
+                    event_count += 1
     except OSError:
         pass
     _write_event("session_end", {"duration_ms": duration_ms, "event_count": event_count}, payload)
@@ -1430,31 +1474,74 @@ def capture_event(event: str, outcome: str, payload: dict) -> None:
             skill = ""
             if isinstance(tool_input, dict):
                 skill = tool_input.get("skill") or tool_input.get("skill_name") or tool_input.get("name") or ""
-            # The Skill matcher fires for EVERY session skill; record only OURS,
-            # since the event is attributed to our product feature record. A
-            # domain of None means "not a Salesforce skill" -> skip silently.
-            bare, domain = _resolve_sf_skill(skill)
-            if domain is None:
-                return
-            _write_event("skill_dispatched", {"skill": bare, "skill_domain": domain}, payload)
+            if ":" not in skill:
+                # Preserve the existing flat-name path exactly: resolve only this
+                # plugin's own skills and drop everything else.
+                bare, domain = _resolve_sf_skill(skill)
+                if domain is None:
+                    return
+                subject_plugin = ""
+            else:
+                prefix, bare = skill.split(":", 1)
+                if prefix == "salesforce-development":
+                    # Preserve validation and output for our qualified skills.
+                    bare, domain = _resolve_sf_skill(skill)
+                    if domain is None:
+                        return
+                elif prefix in _plugin_catalog_origins():
+                    # The qualified dispatch prefix is the owning plugin. Catalog
+                    # membership is the positive allowlist/privacy boundary.
+                    domain = bare.split("-", 1)[0] if "-" in bare else ""
+                else:
+                    return
+                subject_plugin = "" if prefix == "salesforce-development" else prefix
+            fields = {
+                "skill": bare,
+                "skill_domain": domain,
+            }
+            # Keep existing Salesforce Development buffered output byte-identical;
+            # its A4D subject defaults to the emitter. Only net-new catalog-plugin
+            # rows need to persist an explicit subject for projection/counting.
+            if subject_plugin:
+                fields["subject_plugin"] = subject_plugin
+            _write_event("skill_dispatched", fields, payload)
             return
 
         if event == "agent_dispatched":
             # A subagent (Task/Agent tool) was launched. The matcher fires for EVERY
             # agent — built-ins, other plugins', and USER-AUTHORED custom agents whose
-            # type strings are arbitrary and can carry PII. This telemetry is attributed
-            # to OUR product feature, so we record only agents THIS plugin ships; any
-            # built-in / third-party / custom agent is skipped ENTIRELY — no event —
-            # exactly like a non-Salesforce skill. The free-form task prompt/description
-            # is never read. _resolve_sf_agent returns "other" for anything not ours.
+            # type strings are arbitrary and can carry PII. Record our own agents and
+            # qualified agents whose prefix is in the catalog; built-in, third-party,
+            # directory-scoped, held, and custom agents are skipped entirely. The
+            # free-form task prompt/description is never read.
             raw_type = ""
             if isinstance(tool_input, dict):
                 raw_type = (tool_input.get("subagent_type") or tool_input.get("subagentType")
                             or tool_input.get("agent_type") or "")
-            agent_type = _resolve_sf_agent(raw_type)
-            if agent_type in ("", "other"):
-                return  # not one of our agents -> record nothing
-            _write_event("agent_dispatched", {"agent_type": agent_type}, payload)
+            if ":" not in raw_type:
+                # Preserve the existing flat-name path exactly: resolve only this
+                # plugin's own agents and drop everything else.
+                agent_type = _resolve_sf_agent(raw_type)
+                if agent_type in ("", "other"):
+                    return
+                subject_plugin = ""
+            else:
+                prefix, agent_type = raw_type.split(":", 1)
+                if prefix == "salesforce-development":
+                    # Preserve validation and output for our qualified agents.
+                    agent_type = _resolve_sf_agent(raw_type)
+                    if agent_type in ("", "other"):
+                        return
+                elif prefix not in _plugin_catalog_origins():
+                    return
+                subject_plugin = "" if prefix == "salesforce-development" else prefix
+            fields = {
+                "agent_type": agent_type,
+            }
+            # See the skill path above: preserve our existing buffered wire record.
+            if subject_plugin:
+                fields["subject_plugin"] = subject_plugin
+            _write_event("agent_dispatched", fields, payload)
             return
 
         if event == "mcp_tool_used":
@@ -1551,6 +1638,36 @@ def capture_event(event: str, outcome: str, payload: dict) -> None:
             }, payload)
             return
 
+        if event == "plugin_install_result":
+            # Reason is branch-owned. Plugin is allowed through only when it is
+            # one of our generated catalog names; arbitrary/invalid caller input
+            # collapses to a static sentinel rather than reaching the buffer.
+            reason = tool_input.get("reason") if isinstance(tool_input, dict) else ""
+            if reason not in _PLUGIN_INSTALL_REASONS:
+                return
+            raw_plugin = tool_input.get("plugin") if isinstance(tool_input, dict) else ""
+            plugin = raw_plugin if isinstance(raw_plugin, str) \
+                and raw_plugin in _plugin_catalog_origins() else "unknown"
+            _write_event(event, {"plugin": plugin, "reason": reason}, payload)
+            return
+
+        if event == "feedback":
+            # In-process-only call from /feedback's capture step (never a hook):
+            # rating, nothing else. HARD INVARIANT (feedback-telemetry plan):
+            # telemetry never carries free text. Re-validate here, the one
+            # chokepoint every feedback capture passes through -- an invalid
+            # rating drops the whole event.
+            raw_rating = tool_input.get("rating") if isinstance(tool_input, dict) else None
+            # int, not bool (a disguised int) and not float -- a 1-5 rating is
+            # a discrete scale, and disallowing float closes a channel that
+            # could otherwise smuggle more than 5 values' worth of information.
+            if isinstance(raw_rating, bool) or not isinstance(raw_rating, int):
+                return
+            if not (1 <= raw_rating <= 5):
+                return
+            _write_event("feedback", {"rating": raw_rating}, payload)
+            return
+
     except Exception:
         pass  # fail-silent — never break a hook on a telemetry error
     finally:
@@ -1607,7 +1724,7 @@ def cmd_capture(argv: list[str]) -> int:
     hook.
 
     DISCLOSURE: the `session_start` hook is ALSO the universal first-run-notice
-    trigger. It fires in EVERY ui_mode (full/compact/plain/off) and from any project
+    trigger. It fires in EVERY ui_mode (full/plain/off) and from any project
     subdirectory — unlike cmd_detect's banner, which only renders in full mode from
     the project root. So this is where we guarantee the notice is shown to EVERY
     user before any non-session event is captured (capture_event enforces the
@@ -1630,7 +1747,7 @@ def cmd_capture(argv: list[str]) -> int:
         # nothing can later be flushed without the user having been disclosed to.
         # Fire-once: returns lines (None on repeat / opt-out / CI / not-first-run);
         # when we win the race, surface them as a SessionStart systemMessage so
-        # compact/plain/off and subdirectory starts — where detect draws no banner —
+        # plain/off and subdirectory starts — where detect draws no banner —
         # still disclose.
         try:
             lines = first_run_notice_lines()
@@ -1661,7 +1778,9 @@ _FIRST_RUN_NOTICE_LINES = (
     "or editor running the plugin. It also collects the",
     "commands, skills, subagents, and MCP tools that ran,",
     "whether each succeeded or failed, and coarse",
-    "error categories. The plugin never collects source code,",
+    "error categories. If you use /feedback, it also collects a",
+    "numeric satisfaction rating -- never your typed comments.",
+    "The plugin never collects source code,",
     "org contents, file paths, credentials, or org names.",
     "",
     "To disable telemetry, run this command:",
@@ -1719,8 +1838,8 @@ def _notice_shown() -> bool:
 
 def _render_notice_systemmessage(lines: list) -> str:
     """Render the plain notice lines as a self-contained systemMessage for the UI
-    modes / entry paths that do NOT draw the full SessionStart banner (compact,
-    plain, off, or a start from a project SUBDIRECTORY, where detect renders no
+    modes / entry paths that do NOT draw the full SessionStart banner (plain,
+    off, or a start from a project SUBDIRECTORY, where detect renders no
     banner). This is telemetry's OWN minimal framing — it deliberately does not
     import sf_context's band renderer (telemetry stays dependency-free and
     fail-silent). The full-banner path still weaves the same lines in prettier."""
@@ -1915,6 +2034,19 @@ def _to_pdp_event(record: dict, org_bucket: Optional[str] = None) -> Optional[di
         return {**base, "eventName": "command.invoked", "componentId": comp,
                 "contextName": "outcome::category",
                 "contextValue": f"{p.get('outcome', '')}::{p.get('category', '')}"}
+    if event == "plugin_install_result":
+        # Keep command.invoked's wire shape unchanged for existing dashboards.
+        # This additive event is the interpretable companion signal: a validated
+        # catalog plugin (or fixed sentinel) plus one closed-vocabulary reason.
+        reason = p.get("reason")
+        if reason not in _PLUGIN_INSTALL_REASONS:
+            return None
+        raw_plugin = p.get("plugin")
+        plugin = raw_plugin if isinstance(raw_plugin, str) \
+            and raw_plugin in _plugin_catalog_origins() else "unknown"
+        return {**base, "eventName": "pluginInstall.completed",
+                "componentId": plugin,
+                "contextName": "reason", "contextValue": reason}
     if event == "skill_dispatched":
         # The bare skill name (platform-apex-generate) already embeds its domain,
         # so it stands alone as the componentId; skill_domain is the grouping dim.
@@ -1965,6 +2097,16 @@ def _to_pdp_event(record: dict, org_bucket: Optional[str] = None) -> Optional[di
                 "componentId": p.get("plugin") or "plugin",
                 "contextName": "origin::confidence::surface",
                 "contextValue": f"{p.get('origin', '')}::{p.get('confidence', '')}::{p.get('surface', '')}"}
+    if event == "feedback":
+        # Rigid PDP shape on purpose (over the flexible a4d/UIP bag): rating is a
+        # genuine numeric metric, so it rides `eventVolume` (the sum metric). No
+        # per-event context dimension -- the theme picker was removed, and rating
+        # alone is the whole signal now; never a free-text-shaped field.
+        rating = p.get("rating")
+        return {**base, "eventName": "feedback.submitted",
+                "componentId": "feedback",
+                "eventVolume": rating if isinstance(rating, (int, float)) else 0,
+                "contextName": "", "contextValue": ""}
     return None
 
 
@@ -2062,6 +2204,11 @@ def _to_a4d_event(record: dict, org_bucket: Optional[str] = None,
     # componentId/contextName/contextValue).
     if rec.get("event") == "skill_dispatched" and p.get("skill"):
         attributes["skillName"] = str(p.get("skill"))
+    if rec.get("event") in ("skill_dispatched", "agent_dispatched"):
+        # Pre-change buffered dispatches can lack subject_plugin; those rows were
+        # necessarily ours because non-Salesforce dispatches were dropped.
+        attributes["subjectPlugin"] = str(
+            p.get("subject_plugin") or "salesforce-development")
     # Raw org id rides UIP ONLY, and ONLY when live-resolved (non-empty) — never
     # enveloped on the buffered record, never on PDP events.
     if org_id:
@@ -2292,6 +2439,35 @@ def _session_has_events(session_id: str) -> bool:
         return False
 
 
+def _flush_orphan_buffer() -> None:
+    """Best-effort hand-off of the session-less buffer (telemetry-buffer-nosession.jsonl)
+    to the detached sender, piggybacking on any SessionEnd flush.
+
+    A capture call that never carries a session_id lands in this shared file rather
+    than a per-session one, and no SessionEnd hook is ever addressed to "no session" —
+    so without this sweep, such records would sit stranded on disk forever. This is
+    swept opportunistically on every flush, regardless of which session is ending, so
+    one always eventually ships it. Never raises; a missing, empty, or already-claimed
+    file (a concurrent flush won the rename race) is a silent no-op."""
+    try:
+        orphan = _session_buffer("")
+        if not orphan.exists() or orphan.stat().st_size == 0:
+            return
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        snapshot = _STATE_DIR / f"telemetry-snapshot-{os.getpid()}-orphan.jsonl"
+        try:
+            os.replace(orphan, snapshot)
+        except OSError:
+            return  # already claimed by a concurrent flush, or a transient FS error
+        if not _spawn_sender(snapshot):
+            try:
+                snapshot.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def cmd_flush(argv: list[str]) -> int:
     """`telemetry-flush` — SessionEnd hook. Hand the buffer off for async transmit.
 
@@ -2304,7 +2480,9 @@ def cmd_flush(argv: list[str]) -> int:
     with any other SessionEnd hook.
 
     A session with no captured activity is skipped wholesale (no session_end, no
-    spawn) — there is nothing worth an upload."""
+    spawn) — there is nothing worth an upload. Every call also sweeps the orphaned
+    session-less buffer (see _flush_orphan_buffer), independent of whether THIS
+    session had anything of its own."""
     def _done() -> int:
         print(json.dumps({"continue": True}))
         return 0
@@ -2321,6 +2499,10 @@ def cmd_flush(argv: list[str]) -> int:
         payload = _read_payload()
         sid = payload.get("session_id") or payload.get("sessionId") or ""
         buf = _session_buffer(sid)
+        # Piggyback the orphan sweep on every flush, whether or not THIS session
+        # captured anything itself — this is the only place a session-less capture
+        # (e.g. a piped telemetry-capture call that omitted session_id) ever ships.
+        _flush_orphan_buffer()
         # Flush only when THIS session captured something.
         if not _session_has_events(sid):
             return _done()
@@ -2420,6 +2602,102 @@ def cmd_transmit(argv: list[str]) -> int:
     return 0
 
 
+# --- Feedback rating (backs /salesforce-development:feedback) ---------------
+
+def _feedback_ineligibility_reason() -> Optional[str]:
+    """Return why a feedback rating would be skipped right now, or None if a
+    capture would proceed to the actual buffer write. Mirrors capture_event's
+    own early gates (env opt-out, consent, project scope, disclosure) in the
+    same order, so the command can explain a skip to the user BEFORE asking for
+    a rating — without re-implementing or drifting from the real gate logic
+    capture_event enforces at commit time. Read-only: never stages, writes, or
+    claims any marker itself."""
+    if _env_optout():
+        return "telemetry_disabled"
+    cfg0 = _load_consent()
+    if not cfg0.get("enabled", True):
+        return "telemetry_disabled"
+    if not _in_sf_project():
+        return "not_sf_project"
+    if not _is_ci() and not _notice_shown():
+        return "unavailable"
+    return None
+
+
+def capture_feedback_rating(rating: object, session_id: str) -> tuple[str, str]:
+    """Record a 1-5 feedback rating and report exactly what happened, as
+    (result, reason) where result is "recorded" | "skipped" | "error".
+
+    "recorded" is reported ONLY after the event is actually committed to the
+    session buffer — never from an eligibility precheck alone — so a caller's
+    confirmation to the user is always accurate. capture_event() itself stays
+    void and fail-silent (it's also used by hooks that don't care about the
+    outcome), so success here is observed the only externally visible way a
+    caller can: the session buffer growing. A benign race (e.g. a concurrent
+    capture on the same session) can at worst under-report as "skipped" —
+    never falsely claim "recorded" — which matches the fail-closed spirit of
+    every other telemetry gate in this module."""
+    if isinstance(rating, bool) or not isinstance(rating, int) or not (1 <= rating <= 5):
+        return ("error", "invalid_rating")
+    reason = _feedback_ineligibility_reason()
+    if reason is not None:
+        return ("skipped", reason)
+    buf = _session_buffer(session_id)
+    try:
+        before = buf.stat().st_size if buf.exists() else -1
+    except OSError:
+        before = -1
+    capture_event("feedback", "", {"tool_input": {"rating": rating}, "session_id": session_id})
+    try:
+        after = buf.stat().st_size if buf.exists() else -1
+    except OSError:
+        after = -1
+    if after > before:
+        return ("recorded", "")
+    return ("skipped", "unavailable")
+
+
+def cmd_feedback_eligibility(argv: list[str]) -> int:
+    """`feedback-eligibility` — report, WITHOUT capturing anything, whether a
+    feedback rating would actually be recorded right now. Lets the /feedback
+    command explain a skip (e.g. "you're not in a Salesforce project", "telemetry
+    is turned off") BEFORE asking the user for a rating, instead of asking first
+    and silently dropping the answer after."""
+    reason = _feedback_ineligibility_reason()
+    if reason is None:
+        print(json.dumps({"eligible": True}))
+    else:
+        print(json.dumps({"eligible": False, "reason": reason}))
+    return 0
+
+
+def cmd_feedback_record(argv: list[str]) -> int:
+    """`feedback-record <rating>` — record a 1-5 satisfaction rating as local
+    usage telemetry and report exactly what happened via {"result": ...} on
+    stdout: "recorded" once the event is actually committed, "skipped" with a
+    reason when a consent/scope/disclosure gate blocked it, or "error" with
+    reason "invalid_rating" for anything not a bare integer 1-5.
+
+    Reads the session id itself from CLAUDE_CODE_SESSION_ID (the same host-
+    provided env var the old `echo ... | telemetry-capture feedback` pipeline
+    asked the model to interpolate into a shell one-liner) instead of requiring
+    a caller-supplied env expansion, so the whole invocation is a static,
+    literal command — no pipe, no variable expansion — that a narrow
+    allowed-tools rule can match without an approval prompt."""
+    raw = argv[2] if len(argv) > 2 else ""
+    try:
+        rating: object = int(str(raw), 10)
+    except (TypeError, ValueError):
+        rating = raw
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    result, reason = capture_feedback_rating(rating, session_id)
+    out = {"result": result}
+    if reason:
+        out["reason"] = reason
+    print(json.dumps(out))
+    return 0
+
+
 # --- Dispatch (called by sf_context.main for any telemetry* command) ---------
 
 def dispatch(argv: list[str]) -> int:
@@ -2434,6 +2712,10 @@ def dispatch(argv: list[str]) -> int:
         return cmd_consent(argv)
     if cmd == "telemetry-capture":
         return cmd_capture(argv)
+    if cmd == "feedback-eligibility":
+        return cmd_feedback_eligibility(argv)
+    if cmd == "feedback-record":
+        return cmd_feedback_record(argv)
     print(json.dumps({"continue": True}))
     return 0
 

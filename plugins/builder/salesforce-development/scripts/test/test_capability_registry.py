@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Channel registry, canonical hashing, and public-release manifest contracts."""
+"""Channel registry and canonical skill-tree hashing contracts."""
 from __future__ import annotations
 
 import json
 import os
-import re
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,10 +15,7 @@ from unittest import mock
 from _test_support import load_module
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-PLUGIN_ROOT = SCRIPTS.parent
-REPO_ROOT = PLUGIN_ROOT.parents[2]
 REGISTRY_PATH = SCRIPTS / "capability_registry.py"
-MANIFEST_PATH = PLUGIN_ROOT / "catalog/public-release-manifest.json"
 
 
 class CapabilityRegistryTests(unittest.TestCase):
@@ -219,409 +216,201 @@ class CapabilityRegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(self.registry.RegistryError, "symlink|regular"):
                 self.registry.skill_directories(root)
 
-    def _public_checkout_fixture(self, root: Path, origin: str) -> Path:
-        checkout = root / "checkout"
-        checkout.mkdir()
-        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
-        subprocess.run(["git", "-C", str(checkout), "config", "user.email", "fixture@example.invalid"], check=True)
-        subprocess.run(["git", "-C", str(checkout), "config", "user.name", "Fixture"], check=True)
-        skill = checkout / "skills/platform-widget-search"
-        skill.mkdir(parents=True)
-        skill.joinpath("SKILL.md").write_text(
-            '---\nname: platform-widget-search\ndescription: "Use this public fixture to search for platform widgets safely and deterministically."\n---\nbody\n',
-            encoding="utf-8",
+    def test_hash_skills_cli_prints_canonical_hashes_for_each_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            one = root / "skill-one"
+            one.mkdir()
+            one.joinpath("SKILL.md").write_text(
+                '---\nname: skill-one\ndescription: "d"\n---\n', encoding="utf-8"
+            )
+            two = root / "skill-two"
+            two.mkdir()
+            two.joinpath("SKILL.md").write_text(
+                '---\nname: skill-two\ndescription: "d"\n---\n', encoding="utf-8"
+            )
+            result = subprocess.run(
+                [sys.executable, str(REGISTRY_PATH), "--hash-skills", str(one), str(two)],
+                capture_output=True, text=True, check=True,
+            )
+            payload = json.loads(result.stdout)
+            self.assertEqual(set(payload), {str(one), str(two)})
+            for skill_dir in (one, two):
+                row = payload[str(skill_dir)]
+                self.assertEqual(set(row), {"skillMdSha256", "treeSha256"})
+                self.assertEqual(row["skillMdSha256"], self.registry.sha256_file(skill_dir / "SKILL.md"))
+                self.assertEqual(row["treeSha256"], self.registry.canonical_tree_sha256(skill_dir))
+            self.assertNotEqual(
+                payload[str(one)]["treeSha256"], payload[str(two)]["treeSha256"]
+            )
+
+    def test_hash_skills_cli_fails_loud_on_missing_skill(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "does-not-exist"
+            result = subprocess.run(
+                [sys.executable, str(REGISTRY_PATH), "--hash-skills", str(missing)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("capability registry error", result.stderr)
+
+    def _skill_bytes(self, name: str, description: str, distribution: str) -> tuple[bytes, Path]:
+        content = (
+            "---\n"
+            f"name: {name}\n"
+            f'description: "{description}"\n'
+            "metadata:\n"
+            '  version: "1.0"\n'
+            f"{distribution}"
+            "---\n\n# Body\n"
+        ).encode("utf-8")
+        return content, Path("/tmp") / name / "SKILL.md"
+
+    def test_headless_only_skill_may_exceed_description_cap(self):
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content, path = self._skill_bytes(
+            "automotive-cloud-headless-configure",
+            over,
+            "  distribution:\n    headless360Mcp:\n      visibility: \"public\"\n",
         )
-        # One more skill exercises the accessCheck binary state through the real
-        # snapshot path: a conditional license/preference gate. platform-widget-search
-        # stays the undeclared (no metadata block) case.
-        gated = checkout / "skills/platform-gated-search"
-        gated.mkdir(parents=True)
-        gated.joinpath("SKILL.md").write_text(
-            '---\nname: platform-gated-search\ndescription: "Use this public fixture to confirm a conditional accessCheck list survives the snapshot as license and preference gates."\nmetadata:\n  version: "1.0"\n  accessCheck:\n    - type: "license"\n      value: "FixtureLicense"\n    - type: "orgPref"\n      value: "FixturePref"\n---\nbody\n',
-            encoding="utf-8",
+        fields = self.registry.read_skill_bytes(content, path)
+        self.assertEqual(len(fields["description"]), self.registry.DESCRIPTION_MAX + 50)
+
+    def test_sf_skills_skill_still_fails_over_description_cap(self):
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content, path = self._skill_bytes(
+            "automotive-cloud-public-configure",
+            over,
+            "  distribution:\n    sf-skills:\n      visibility: \"public\"\n",
         )
-        subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
-        subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "fixture"], check=True)
-        subprocess.run(
-            ["git", "-C", str(checkout), "tag", "--no-sign", "-m", "fixture", "1.32.0"],
-            check=True,
+        with self.assertRaisesRegex(self.registry.RegistryError, "outside supported bounds"):
+            self.registry.read_skill_bytes(content, path)
+
+    def test_headless_and_sf_skills_skill_is_not_exempt(self):
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content, path = self._skill_bytes(
+            "automotive-cloud-both-configure",
+            over,
+            "  distribution:\n"
+            "    headless360Mcp:\n      visibility: \"public\"\n"
+            "    sf-skills:\n      visibility: \"public\"\n",
         )
-        subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", origin], check=True)
-        return checkout
+        with self.assertRaisesRegex(self.registry.RegistryError, "outside supported bounds"):
+            self.registry.read_skill_bytes(content, path)
 
-    def test_public_snapshot_rejects_ignored_entries_under_skills(self):
-        with tempfile.TemporaryDirectory() as td:
-            checkout = self._public_checkout_fixture(
-                Path(td), "https://github.com/forcedotcom/sf-skills.git"
-            )
-            checkout.joinpath(".git/info/exclude").write_text("skills/**/ignored.bin\n", encoding="utf-8")
-            checkout.joinpath("skills/platform-widget-search/ignored.bin").write_bytes(b"absent from commit")
-            with self.assertRaisesRegex(self.registry.RegistryError, "tracked git tree"):
-                self.registry.build_public_manifest(checkout, "1.32.0")
-
-    def test_public_origin_normalizes_supported_github_forms_without_echoing_tokens(self):
-        accepted = (
-            "https://github.com/forcedotcom/sf-skills.git",
-            "https://github.com/forcedotcom/sf-skills",
-            "git@github.com:forcedotcom/sf-skills.git",
-            "ssh://git@github.com/forcedotcom/sf-skills.git",
-            "https://x-access-token:do-not-echo@github.com/forcedotcom/sf-skills.git",
+    def test_headless_channel_in_comment_does_not_grant_exemption(self):
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content, path = self._skill_bytes(
+            "automotive-cloud-comment-configure",
+            over,
+            "  distribution:\n"
+            "    sf-skills:  # headless360Mcp: not really declared\n"
+            "      visibility: \"public\"\n",
         )
-        for origin in accepted:
-            with self.subTest(origin=origin):
-                self.assertEqual(self.registry.normalize_public_repository(origin), self.registry.PUBLIC_REPOSITORY)
-        for origin in (
-            "https://github.com/other/sf-skills.git",
-            "https://gitlab.com/forcedotcom/sf-skills.git",
-            "http://github.com/forcedotcom/sf-skills.git",
-        ):
-            with self.subTest(origin=origin):
-                with self.assertRaises(self.registry.RegistryError) as caught:
-                    self.registry.normalize_public_repository(origin)
-                self.assertNotIn(origin, str(caught.exception))
-                self.assertNotIn("do-not-echo", str(caught.exception))
+        with self.assertRaisesRegex(self.registry.RegistryError, "outside supported bounds"):
+            self.registry.read_skill_bytes(content, path)
 
-    def test_public_release_ref_is_strict_and_resolves_to_recorded_commit(self):
-        with tempfile.TemporaryDirectory() as td:
-            checkout = self._public_checkout_fixture(Path(td), "git@github.com:forcedotcom/sf-skills.git")
-            manifest = self.registry.build_public_manifest(checkout, "1.32.0")
-            self.assertEqual(manifest["releaseRef"], "1.32.0")
-            self.assertEqual(manifest["repository"], self.registry.PUBLIC_REPOSITORY)
-            for release_ref in ("v1.32.0", "main", "1.32", "1.32.0^{commit}"):
-                with self.subTest(release_ref=release_ref):
-                    with self.assertRaises(self.registry.RegistryError):
-                        self.registry.build_public_manifest(checkout, release_ref)
+    def test_headless_only_same_line_flow_form_is_exempt(self):
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content, path = self._skill_bytes(
+            "automotive-cloud-sameflow-configure",
+            over,
+            '  distribution: {headless360Mcp: {visibility: "public"}}\n',
+        )
+        fields = self.registry.read_skill_bytes(content, path)
+        self.assertEqual(len(fields["description"]), self.registry.DESCRIPTION_MAX + 50)
 
-    def test_public_manifest_carries_accesscheck_binary_state(self):
-        # The snapshot must preserve the accessCheck binary state distinctly:
-        # undeclared (None, no metadata block) vs. conditional (a typed list).
-        # accessCheck: [] is no longer a valid third state — read_access_check
-        # rejects it outright (see test_read_access_check_reads_binary_state_and_fails_loud_on_damage).
-        with tempfile.TemporaryDirectory() as td:
-            checkout = self._public_checkout_fixture(
-                Path(td), "git@github.com:forcedotcom/sf-skills.git"
-            )
-            manifest = self.registry.build_public_manifest(checkout, "1.32.0")
-            access = {row["name"]: row["accessCheck"] for row in manifest["skills"]}
-            for row in manifest["skills"]:
-                self.assertIn("accessCheck", row)
-            self.assertIsNone(access["platform-widget-search"])
-            self.assertEqual(
-                access["platform-gated-search"],
-                [
-                    {"type": "license", "value": "FixtureLicense"},
-                    {"type": "orgPref", "value": "FixturePref"},
-                ],
-            )
+    def test_headless_only_child_line_flow_form_is_exempt(self):
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content, path = self._skill_bytes(
+            "automotive-cloud-childflow-configure",
+            over,
+            "  distribution:\n"
+            '    {headless360Mcp: {visibility: "public"}}\n',
+        )
+        fields = self.registry.read_skill_bytes(content, path)
+        self.assertEqual(len(fields["description"]), self.registry.DESCRIPTION_MAX + 50)
 
-    def test_read_access_check_reads_binary_state_and_fails_loud_on_damage(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "SKILL.md"
+    def test_headless_key_under_mcptools_does_not_grant_exemption(self):
+        # requirement: a same-named key OUTSIDE metadata.distribution must not spoof the
+        # carve-out. Skill is sf-skills-only, so the over-length cap must still throw.
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content, path = self._skill_bytes(
+            "automotive-cloud-mcpspoof-configure",
+            over,
+            "  mcpTools:\n"
+            "    headless360Mcp:\n"
+            "      tools: [\"dispatch\"]\n"
+            "      semver: \">=1.0.0\"\n"
+            "  distribution:\n"
+            "    sf-skills:\n      visibility: \"public\"\n",
+        )
+        with self.assertRaisesRegex(self.registry.RegistryError, "outside supported bounds"):
+            self.registry.read_skill_bytes(content, path)
 
-            def parse(body: str):
-                path.write_text(body, encoding="utf-8")
-                return self.registry.read_access_check(path)
+    def test_sf_skills_key_under_mcptools_does_not_defeat_headless_exemption(self):
+        # inverse spoof: a stray sf-skills key OUTSIDE distribution must not turn a
+        # genuinely headless-only skill into a capped one.
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content, path = self._skill_bytes(
+            "automotive-cloud-inversespoof-configure",
+            over,
+            "  mcpTools:\n"
+            "    sf-skills:\n"
+            "      tools: [\"x\"]\n"
+            "      semver: \">=1.0.0\"\n"
+            "  distribution:\n"
+            "    headless360Mcp:\n      visibility: \"public\"\n",
+        )
+        fields = self.registry.read_skill_bytes(content, path)
+        self.assertEqual(len(fields["description"]), self.registry.DESCRIPTION_MAX + 50)
 
-            # Undeclared: no metadata block, and a metadata block without the key.
-            self.assertIsNone(parse('---\nname: x\ndescription: "d"\n---\nbody\n'))
-            self.assertIsNone(parse('---\nname: x\ndescription: "d"\nmetadata:\n  version: "1.0"\n---\n'))
-            # Conditional: block-style typed entries and an inline JSON array.
-            self.assertEqual(
-                parse('---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck:\n    - type: "license"\n      value: "Foo"\n    - type: "orgPref"\n      value: "Bar"\n---\n'),
-                [{"type": "license", "value": "Foo"}, {"type": "orgPref", "value": "Bar"}],
-            )
-            self.assertEqual(
-                parse('---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck: [{"type": "userPerm", "value": "Baz"}]\n---\n'),
-                [{"type": "userPerm", "value": "Baz"}],
-            )
-            # Fail loud, never silently "undeclared": an empty inline list, a
-            # present-but-empty bare key, a malformed block entry, and an inline
-            # scalar are all rejected outright — accessCheck: [] carries no meaning
-            # (same rationale as cliTools/relatedSkills), so omit the field entirely
-            # instead.
-            with self.assertRaisesRegex(self.registry.RegistryError, "omit the field"):
-                parse('---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck: []\n---\n')
-            with self.assertRaisesRegex(self.registry.RegistryError, "omit the field"):
-                parse('---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck:\n---\n')
-            with self.assertRaisesRegex(self.registry.RegistryError, "malformed accessCheck"):
-                parse('---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck:\n    type: "license"\n---\n')
-            with self.assertRaisesRegex(self.registry.RegistryError, "must be an array"):
-                parse('---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck: "license"\n---\n')
+    def test_comment_on_distribution_key_line_does_not_break_block_detection(self):
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content, path = self._skill_bytes(
+            "automotive-cloud-keycomment-configure",
+            over,
+            "  distribution:  # channels declared below\n"
+            "    headless360Mcp:\n      visibility: \"public\"\n",
+        )
+        fields = self.registry.read_skill_bytes(content, path)
+        self.assertEqual(len(fields["description"]), self.registry.DESCRIPTION_MAX + 50)
 
-    def test_read_access_check_enforces_entry_content_rules(self):
-        # Content-quality checks on populated entries, mirroring
-        # scripts/validate-skills.ts: no empty/whitespace-only value, no
-        # leading/trailing whitespace, no embedded whitespace in
-        # userPerm/orgPerm/orgPref, no duplicate {type, value} pairs. These
-        # apply to both the block-style and inline-JSON parse paths.
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "SKILL.md"
+    def test_block_scalar_description_prose_cannot_inject_phantom_headless_channel(self):
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content = (
+            "---\n"
+            "name: automotive-cloud-proseinject-configure\n"
+            "description: >-\n"
+            f"  {over}\n"
+            "  distribution: {headless360Mcp: {visibility: public}}\n"
+            "metadata:\n"
+            '  version: "1.0"\n'
+            "  distribution:\n"
+            "    sf-skills:\n      visibility: \"public\"\n"
+            "---\n\n# Body\n"
+        ).encode("utf-8")
+        path = Path("/tmp") / "automotive-cloud-proseinject-configure" / "SKILL.md"
+        with self.assertRaisesRegex(self.registry.RegistryError, "outside supported bounds"):
+            self.registry.read_skill_bytes(content, path)
 
-            def parse(body: str):
-                path.write_text(body, encoding="utf-8")
-                return self.registry.read_access_check(path)
-
-            # Clean, distinct, well-formed entries pass.
-            self.assertEqual(
-                parse(
-                    '---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck:\n'
-                    '    - type: "license"\n      value: "DataCloud"\n'
-                    '    - type: "userPerm"\n      value: "UserPermissions.ResetPasswords"\n---\n'
-                ),
-                [
-                    {"type": "license", "value": "DataCloud"},
-                    {"type": "userPerm", "value": "UserPermissions.ResetPasswords"},
-                ],
-            )
-
-            with self.assertRaisesRegex(self.registry.RegistryError, "empty or whitespace-only value"):
-                parse('---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck:\n    - type: "license"\n      value: "   "\n---\n')
-
-            with self.assertRaisesRegex(self.registry.RegistryError, "leading/trailing whitespace"):
-                parse('---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck:\n    - type: "license"\n      value: " DataCloud "\n---\n')
-
-            for t in ("userPerm", "orgPerm", "orgPref"):
-                with self.assertRaisesRegex(self.registry.RegistryError, "embedded whitespace"):
-                    parse(f'---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck:\n    - type: "{t}"\n      value: "Foo Bar"\n---\n')
-
-            # license/accessCheck types are not subject to the embedded-whitespace rule.
-            for t in ("license", "accessCheck"):
-                parse(f'---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck:\n    - type: "{t}"\n      value: "Foo Bar"\n---\n')
-
-            with self.assertRaisesRegex(self.registry.RegistryError, "duplicate entries"):
-                parse(
-                    '---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck:\n'
-                    '    - type: "license"\n      value: "DataCloud"\n'
-                    '    - type: "license"\n      value: "DataCloud"\n---\n'
-                )
-
-            # Note: unlike validate-skills.ts (which collects all lint errors before
-            # reporting), read_access_check fails fast on the first violation — an
-            # entry with both surrounding whitespace AND a duplicate value raises on
-            # the whitespace check first, never reaching the duplicate check. That is
-            # covered directly above; no separate "duplicate after trim" case here.
-
-            # Same rules apply on the inline-JSON parse path.
-            with self.assertRaisesRegex(self.registry.RegistryError, "empty or whitespace-only value"):
-                parse('---\nname: x\ndescription: "d"\nmetadata:\n  accessCheck: [{"type": "license", "value": "   "}]\n---\n')
-
-    def test_public_check_detects_missing_snapshot_and_drift(self):
-        # check_public is the public-manifest digest-drift gate. Missing destination
-        # → surfaced; a fresh snapshot → current; any byte change → stale. All fail
-        # LOUD (RegistryError), never a silent "current".
-        with tempfile.TemporaryDirectory() as td:
-            checkout = self._public_checkout_fixture(
-                Path(td), "git@github.com:forcedotcom/sf-skills.git"
-            )
-            dest = Path(td) / "public-release-manifest.json"
-            with self.assertRaisesRegex(self.registry.RegistryError, "missing"):
-                self.registry.check_public(checkout, dest, "1.32.0")
-            self.registry.snapshot_public(checkout, dest, "1.32.0")
-            self.assertTrue(self.registry.check_public(checkout, dest, "1.32.0"))
-            dest.write_text(dest.read_text(encoding="utf-8") + "\n", encoding="utf-8")
-            with self.assertRaisesRegex(self.registry.RegistryError, "stale"):
-                self.registry.check_public(checkout, dest, "1.32.0")
-
-    def test_checked_public_manifest_counts_and_access_check_tri_state(self):
-        manifest = self.registry.load_public_manifest(MANIFEST_PATH)
-        self.assertEqual(manifest["repository"], "https://github.com/forcedotcom/sf-skills.git")
-        self.assertEqual(manifest["commit"], "32bf7846b96d4fcb1b2f5c7c06c09a1d9b3cea03")
-        self.assertEqual(manifest["releaseRef"], "1.41.0")
-        self.assertEqual(manifest["counts"], {"public": 157})
-        self.assertEqual(len(manifest["skills"]), 157)
-        # accessCheck travels through the manifest as a tri-state (Option A). Every
-        # row carries the key; at 1.41.0 a fixed set of skills declare a conditional
-        # gate and the rest are undeclared (None) — never silently [], which would
-        # falsely claim org-agnostic before the backfill lands.
-        for row in manifest["skills"]:
-            self.assertNotIn("description", row)
-            self.assertIn("examplePrompt", row)
-            self.assertTrue(self.registry.is_user_prompt_like(row["examplePrompt"]))
-            self.assertIn("accessCheck", row)
-            self.assertTrue(self.registry._valid_access_check(row["accessCheck"]))
-        gated = {row["name"]: row["accessCheck"] for row in manifest["skills"] if row["accessCheck"] is not None}
-        self.assertEqual(gated, {
-            "dx-devops-pipeline-manage": [
-                {"type": "orgPref", "value": "ALMDevopsCorePref"},
-                {"type": "userPerm", "value": "UserHasDevOpsCore"},
-            ],
-            "dx-devops-promote": [
-                {"type": "orgPref", "value": "ALMDevopsCorePref"},
-                {"type": "userPerm", "value": "UserHasDevOpsCore"},
-            ],
-            "dx-org-devhub-configure": [
-                {"type": "userPerm", "value": "ModifyAllData"},
-            ],
-            "experience-ui-bundle-2gp-deploy": [
-                {"type": "orgPref", "value": "Package2Enabled"},
-            ],
-            "experience-ui-bundle-features-generate": [
-                {"type": "license", "value": "Experience Cloud (Customer Community / Customer Community Plus)"},
-                {"type": "orgPref", "value": "Sites"},
-            ],
-            "experience-ui-bundle-mfa-configure": [
-                {"type": "license", "value": "Experience Cloud (Customer Community / Customer Community Login)"},
-            ],
-            "platform-datamask-run": [
-                {"type": "userPerm", "value": "PermissionsManageDataMaskPolicies"},
-                {"type": "userPerm", "value": "PermissionsAccessDataMaskAndSeed"},
-            ],
-            "platform-sandbox-configure": [
-                {"type": "userPerm", "value": "ManageSandboxes"},
-            ],
-            "service-catalog-template-deploy": [
-                {"type": "accessCheck", "value": "IndustriesEpc.orgHasUnifiedCatalog"},
-            ],
-            "service-catalog-template-search": [
-                {"type": "accessCheck", "value": "IndustriesEpc.orgHasUnifiedCatalog"},
-            ],
-            "service-concierge-portal-generate": [
-                {"type": "license", "value": "Agentforce"},
-            ],
-            "service-itsm-agentic-setup-agentforce-coordinate": [
-                {"type": "license", "value": "Agentforce"},
-            ],
-            "service-itsm-agentic-setup-agentforce-studio-configure": [
-                {"type": "license", "value": "Agentforce"},
-            ],
-            "service-itsm-agentic-setup-agentforce-studio-validate": [
-                {"type": "license", "value": "Agentforce"},
-            ],
-            "service-itsm-agentic-setup-cmdb-bundle-deploy": [
-                {"type": "orgPerm", "value": "ITSrvcsCnfgMgmnt"},
-                {"type": "orgPref", "value": "CMDBEnabled"},
-            ],
-            "service-itsm-agentic-setup-cmdb-configure": [
-                {"type": "orgPerm", "value": "ITSrvcsCnfgMgmnt"},
-            ],
-            "service-itsm-agentic-setup-cmdb-coordinate": [
-                {"type": "orgPerm", "value": "ITSrvcsCnfgMgmnt"},
-            ],
-            "service-itsm-agentic-setup-cmdb-discovery-configure": [
-                {"type": "orgPerm", "value": "ITSrvcsCnfgMgmnt"},
-            ],
-            "service-itsm-agentic-setup-employee-agent-configure": [
-                {"type": "license", "value": "Agentforce"},
-            ],
-            "service-itsm-agentic-setup-fulfiller-agent-configure": [
-                {"type": "license", "value": "Agentforce"},
-            ],
-            "service-itsm-agentic-setup-incident-sla-configure": [],
-            "service-itsm-agentic-setup-itsm-agentforce-permset-assign": [
-                {"type": "license", "value": "Agentforce"},
-            ],
-            "service-itsm-agentic-setup-uel-user-create": [
-                {"type": "userPerm", "value": "ManageUsers"},
-                {"type": "userPerm", "value": "ManageProfilesPermissionsets"},
-                {"type": "userPerm", "value": "CustomizeApplication"},
-                {"type": "userPerm", "value": "AssignPermissionSets"},
-            ],
-            "service-itsm-incident-mgmt-configure": [
-                {"type": "userPerm", "value": "CustomizeApplication"},
-                {"type": "orgPerm", "value": "IncidentMgmt.orgHasITSMOrgPermission"},
-            ],
-            "service-itsm-incident-priority-configure": [
-                {"type": "userPerm", "value": "CustomizeApplication"},
-            ],
-            "service-itsm-swarming-configure": [
-                {"type": "orgPref", "value": "ITSMTeamsEnabled"},
-            ],
-            "service-itsm-teams-configure": [
-                {"type": "orgPerm", "value": "MSTeamsSetupAutomationAccess"},
-            ],
-            "service-itsm-teams-coordinate": [],
-            "service-itsm-teams-debug": [
-                {"type": "orgPref", "value": "ITSMTeamsEnabled"},
-            ],
-            "service-itsm-teams-employee-agent-configure": [
-                {"type": "orgPref", "value": "ITSMTeamsEnabled"},
-            ],
-            "service-itsm-teams-itdesk-configure": [
-                {"type": "orgPref", "value": "ITSMTeamsEnabled"},
-            ],
-            "service-itsm-teams-itservice-configure": [
-                {"type": "orgPref", "value": "ITSMTeamsEnabled"},
-            ],
-        })
-
-    def test_public_manifest_loader_rejects_schema_count_order_and_hash_damage(self):
-        baseline = self.registry.load_public_manifest(MANIFEST_PATH)
-        cases = []
-        damaged = json.loads(json.dumps(baseline))
-        damaged["extra"] = True
-        cases.append(damaged)
-        damaged = json.loads(json.dumps(baseline))
-        damaged["counts"]["public"] -= 1
-        cases.append(damaged)
-        damaged = json.loads(json.dumps(baseline))
-        damaged["releaseRef"] = "main"
-        cases.append(damaged)
-        damaged = json.loads(json.dumps(baseline))
-        damaged["skills"][0]["treeSha256"] = "bad"
-        cases.append(damaged)
-        damaged = json.loads(json.dumps(baseline))
-        damaged["skills"][0], damaged["skills"][1] = damaged["skills"][1], damaged["skills"][0]
-        cases.append(damaged)
-        # accessCheck damage: a missing key (the tri-state must be explicit, never
-        # omitted), a non-list scalar, and a malformed entry. [] is intentionally
-        # NOT a damage case — it is the valid any-org signal.
-        damaged = json.loads(json.dumps(baseline))
-        del damaged["skills"][0]["accessCheck"]
-        cases.append(damaged)
-        damaged = json.loads(json.dumps(baseline))
-        damaged["skills"][0]["accessCheck"] = "license"
-        cases.append(damaged)
-        damaged = json.loads(json.dumps(baseline))
-        damaged["skills"][0]["accessCheck"] = [{"type": "bogus", "value": "x"}]
-        cases.append(damaged)
-        damaged = json.loads(json.dumps(baseline))
-        damaged["skills"][0]["accessCheck"] = [{"type": "license"}]
-        cases.append(damaged)
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "manifest.json"
-            for data in cases:
-                path.write_text(json.dumps(data), encoding="utf-8")
-                with self.assertRaises(self.registry.RegistryError):
-                    self.registry.load_public_manifest(path)
-
-    def test_public_artifacts_do_not_leak_internal_only_names_or_descriptions(self):
-        manifest = self.registry.load_public_manifest(MANIFEST_PATH)
-        public = {row["name"] for row in manifest["skills"]}
-        foundation = {entry.name for entry in (PLUGIN_ROOT / "skills").iterdir() if entry.is_dir()}
-        authoring = {entry.name for entry in (REPO_ROOT / "skills").iterdir() if entry.is_dir()}
-        internal_only = authoring - (public | foundation)
-        evidence_root = REPO_ROOT / "evidence/channel-registry"
-        checked_files = [MANIFEST_PATH] + [
-            path for path in evidence_root.rglob("*") if path.is_file()
-        ]
-        blob = "\n".join(path.read_text(encoding="utf-8") for path in checked_files)
-        for name in internal_only:
-            self.assertNotIn(f'"{name}"', blob)
-            self.assertIsNone(re.search(rf"(?<![a-z0-9-]){re.escape(name)}(?![a-z0-9-])", blob))
-            description = self.registry.read_skill(REPO_ROOT / "skills" / name / "SKILL.md")["description"]
-            self.assertNotIn(description, blob)
-        self.assertNotIn(str(REPO_ROOT), blob)
-        self.assertNotIn("internal-aggregates.json", blob)
-        for forbidden in ("internalOmitted", "flatRepo", "authoringSha", "holdPolicy"):
-            self.assertNotIn(forbidden, blob)
-
-    def test_publishable_plugin_tree_has_no_public_only_or_internal_description_leakage(self):
-        manifest = self.registry.load_public_manifest(MANIFEST_PATH)
-        public = {row["name"] for row in manifest["skills"]}
-        foundation = {entry.name for entry in (PLUGIN_ROOT / "skills").iterdir() if entry.is_dir()}
-        authoring = {entry.name for entry in (REPO_ROOT / "skills").iterdir() if entry.is_dir()}
-        files = [
-            path for path in PLUGIN_ROOT.rglob("*")
-            if path.is_file() and "__pycache__" not in path.parts
-        ]
-        blobs = [(path, path.read_bytes()) for path in files]
-        for name in sorted((public - foundation) | (authoring - public - foundation)):
-            source = REPO_ROOT / "skills" / name / "SKILL.md"
-            if not source.is_file():
-                continue
-            description = self.registry.read_skill(source)["description"].encode("utf-8")
-            leaked = [str(path.relative_to(PLUGIN_ROOT)) for path, blob in blobs if description in blob]
-            self.assertEqual(leaked, [], f"{name} description leaked into publishable plugin tree")
+    def test_block_scalar_description_prose_cannot_strip_headless_exemption(self):
+        over = "x" * (self.registry.DESCRIPTION_MAX + 50)
+        content = (
+            "---\n"
+            "name: automotive-cloud-prosestrip-configure\n"
+            "description: >-\n"
+            f"  {over}\n"
+            "  distribution: {sf-skills: {visibility: public}}\n"
+            "metadata:\n"
+            '  version: "1.0"\n'
+            "  distribution:\n"
+            "    headless360Mcp:\n      visibility: \"public\"\n"
+            "---\n\n# Body\n"
+        ).encode("utf-8")
+        path = Path("/tmp") / "automotive-cloud-prosestrip-configure" / "SKILL.md"
+        fields = self.registry.read_skill_bytes(content, path)
+        self.assertGreater(len(fields["description"]), self.registry.DESCRIPTION_MAX)
 
 
 if __name__ == "__main__":

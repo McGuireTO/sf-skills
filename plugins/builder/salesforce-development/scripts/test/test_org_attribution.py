@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -120,6 +121,86 @@ class OrgAttributionTests(unittest.TestCase):
         self.assertEqual([record["stage"] for record in records], ["Deploy", "Test", "Test"])
         self.assertEqual(len({record.get("orgHash") for record in records}), 1)
         self.assertTrue(all("orgHash" in record for record in records))
+
+    def test_failed_test_attributes_to_same_org_and_feeds_the_nudge_gather(self):
+        # journey-nudges Phase 6 (T7/O3): a later FAILED run attributes to the SAME
+        # org as an earlier passed one, non-decaying (both records persist), and the
+        # gathered NudgeInputs field flips true only while the failure is unresolved.
+        with mock.patch.object(sfx, "get_org_display", return_value={"id": ORG_A_15}):
+            self.capture(sfx.cmd_post_test_run, "sf apex run test --synchronous -o a")
+            self.capture(sfx.cmd_post_test_failure, "sf apex run test --synchronous -o a")
+        records = self.records()
+        self.assertEqual([record["stage"] for record in records], ["Test", "Test"])
+        self.assertEqual([record["outcome"] for record in records], ["passed", "failed"])
+        self.assertEqual(len({record.get("orgHash") for record in records}), 1)
+        self.assertTrue(all("orgHash" in record for record in records))
+
+        state = {"stages": [{"name": n, "status": "future"} for n in sfx.JOURNEY_STAGES],
+                  "currentStage": "Test", "context": {}}
+        with mock.patch.object(sfx, "get_org_display", return_value={"id": ORG_A_15}):
+            inputs = sfx._gather_nudge_inputs(
+                state, self.root, {"id": ORG_A_15}, records, probe_git=False)
+        self.assertTrue(inputs.test_failed_unresolved)
+
+        # A LATER pass resolves it — non-decay: the earlier failed record still
+        # exists on disk, but the gathered fact now reads "resolved".
+        with mock.patch.object(sfx, "get_org_display", return_value={"id": ORG_A_15}):
+            self.capture(sfx.cmd_post_test_run, "sf apex run test --synchronous -o a")
+        records = self.records()
+        self.assertEqual(len(records), 3)  # the failed record was never removed/mutated
+        with mock.patch.object(sfx, "get_org_display", return_value={"id": ORG_A_15}):
+            inputs = sfx._gather_nudge_inputs(
+                state, self.root, {"id": ORG_A_15}, records, probe_git=False)
+        self.assertFalse(inputs.test_failed_unresolved)
+
+    def test_failed_unresolved_does_not_leak_across_orgs(self):
+        # journey-nudges Phase 7 (reviewer note C): a passed test in a DIFFERENT org
+        # must never resolve a failed test in THIS org — test_failed_unresolved is
+        # scoped per org-hash, not "the latest Test event across any org". Two orgs,
+        # one failed (A) and one passed (B), fed to _gather_nudge_inputs directly.
+        displays = {"a": {"id": ORG_A_15}, "b": {"id": ORG_B_15}}
+        with mock.patch.object(sfx, "get_org_display", side_effect=lambda target: displays[target]):
+            self.capture(sfx.cmd_post_test_failure, "sf apex run test --synchronous -o a")
+            self.capture(sfx.cmd_post_test_run, "sf apex run test --synchronous -o b")
+        records = self.records()
+        self.assertEqual(len({record.get("orgHash") for record in records}), 2)
+
+        state = {"stages": [{"name": n, "status": "future"} for n in sfx.JOURNEY_STAGES],
+                  "currentStage": "Test", "context": {}}
+        with mock.patch.object(sfx, "get_org_display", return_value={"id": ORG_A_15}):
+            inputs_a = sfx._gather_nudge_inputs(
+                state, self.root, {"id": ORG_A_15}, records, probe_git=False)
+        self.assertTrue(inputs_a.test_failed_unresolved)  # org A's own failure, unresolved
+
+        with mock.patch.object(sfx, "get_org_display", return_value={"id": ORG_B_15}):
+            inputs_b = sfx._gather_nudge_inputs(
+                state, self.root, {"id": ORG_B_15}, records, probe_git=False)
+        self.assertFalse(inputs_b.test_failed_unresolved)  # org B never failed at all
+
+    def test_gather_nudge_inputs_wires_scratch_expiry_days_from_org_info(self):
+        # journey-nudges Phase 6 (C5): _gather_nudge_inputs reads expirationDate
+        # straight off whatever org_info dict it's handed (duck-typed, matching
+        # every other field this function reads) and turns it into a day count.
+        state = {"stages": [{"name": n, "status": "future"} for n in sfx.JOURNEY_STAGES],
+                  "currentStage": "Connect", "context": {}}
+        expiration = (date.today() + timedelta(days=2)).isoformat()
+        org_info = {"id": ORG_A_15, "expirationDate": expiration, "isExpired": True}
+        inputs = sfx._gather_nudge_inputs(state, self.root, org_info, [], probe_git=False)
+        self.assertEqual(inputs.scratch_expiry_days, 2)
+        # journey-nudges Phase 6 (C5 round 2): isExpired carries through the same
+        # duck-typed path, independent of the date math above.
+        self.assertTrue(inputs.is_scratch_expired)
+
+        # A raw org_display-shaped dict with no expirationDate/isExpired keys at all
+        # (the shape most callers pass) degrades to None/False, not a crash.
+        inputs_raw = sfx._gather_nudge_inputs(state, self.root, {"id": ORG_A_15}, [], probe_git=False)
+        self.assertIsNone(inputs_raw.scratch_expiry_days)
+        self.assertFalse(inputs_raw.is_scratch_expired)
+
+        # SessionStart's own call shape: org_display=None outright.
+        inputs_seed = sfx._gather_nudge_inputs(state, self.root, None, [], probe_git=False)
+        self.assertIsNone(inputs_seed.scratch_expiry_days)
+        self.assertFalse(inputs_seed.is_scratch_expired)
 
     def test_chained_ambiguous_and_unrelated_commands_never_resolve(self):
         commands = (

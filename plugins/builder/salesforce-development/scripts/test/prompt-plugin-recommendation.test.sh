@@ -692,18 +692,22 @@ else
 fi
 
 # Out of a Salesforce project, NAMING Salesforce is the sufficient-intent signal
-# that stands in for the project file: the getting-started welcome fires, and its
-# welcome bridge reuses the SAME high+anchor catalog scorer to fold a one-line
-# install rec into the welcome (docs/design/plugin-catalog.md — the narrow
-# "Project scoped, except when explicitly asked" exception). So a CMS task that
-# names Salesforce now surfaces experience-cms IN the welcome; it is no longer
-# swallowed merely for being outside a project.
+# that stands in for the project file: the getting-started note fires. Since the
+# entered-project-splash plan (Change 2) the note is MODEL-FACING ONLY (rides
+# additionalContext, never a visible paint), and its install-recommendation bridge
+# is re-homed to that same model channel (docs/design/plugin-catalog.md — the narrow
+# "Project scoped, except when explicitly asked" exception): the SAME high+anchor
+# catalog scorer still folds a first-occurrence uninstalled match into the note, so a
+# CMS task that names Salesforce surfaces experience-cms as MODEL context — with no
+# Python-painted presentation. Assert the model note carries the rec ("high-confidence
+# plugin match") AND that no visible "Recommended plugin" surface is painted.
 OUT_OUTSIDE=$(run_prompt "$NONPROJ" "prompt-outside-$$-$RANDOM" \
   "I need to search Salesforce CMS for an existing media asset")
-if echo "$OUT_OUTSIDE" | grep -q "Recommended plugin"; then
-  PASS=$((PASS + 1)); printf '  ok   %-62s → experience-cms folded into welcome\n' "CMS prompt naming Salesforce outside a project bridges the welcome"
+if echo "$OUT_OUTSIDE" | grep -q "high-confidence plugin match" \
+   && ! echo "$OUT_OUTSIDE" | grep -q "Recommended plugin"; then
+  PASS=$((PASS + 1)); printf '  ok   %-62s → experience-cms folded into the model note (no paint)\n' "CMS prompt naming Salesforce outside a project folds the rec model-only"
 else
-  FAIL=$((FAIL + 1)); printf '  FAIL %-62s → %s\n' "CMS prompt naming Salesforce outside a project bridges the welcome" "$OUT_OUTSIDE"
+  FAIL=$((FAIL + 1)); printf '  FAIL %-62s → %s\n' "CMS prompt naming Salesforce outside a project folds the rec model-only" "$OUT_OUTSIDE"
 fi
 
 # The negative that keeps the folder scoped: drop the Salesforce word and the same

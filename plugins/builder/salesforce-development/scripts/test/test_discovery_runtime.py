@@ -35,6 +35,7 @@ DISCOVERY_CMD = "/salesforce-development:discover"
 TAGLINE = "headless Salesforce development, from inside the agent"
 
 sfx = load_module(SF_CONTEXT_PATH, "discovery_runtime_context")
+nr = load_module(SCRIPTS / "nudge_rules.py", "nudge_rules_for_discovery_runtime")
 
 
 class DiscoveryRuntimeTests(unittest.TestCase):
@@ -55,7 +56,7 @@ class DiscoveryRuntimeTests(unittest.TestCase):
                     self.assertEqual(sfx.cmd_discovery(mode), 2)
                 self.assertIn("Usage: sf-context discover", err.getvalue())
 
-    def test_journey_and_where_both_resolve_to_the_journey_signpost(self):
+    def test_journey_and_where_both_resolve_to_the_journey_hints(self):
         cases = ((["journey"], []), (["journey", "--json"], ["--json"]),
                  (["where"], []), (["where", "--json"], ["--json"]))
         for args, forwarded in cases:
@@ -139,11 +140,13 @@ class BannerProvenanceTests(unittest.TestCase):
         )
 
     def test_banner_block_is_headless_360_with_artifact_derived_identity(self):
-        # Color is painted on by default; the identity is asserted on the
-        # visible (ANSI-stripped) text so the goldens track content, not SGR.
+        # Color is on by default; the colored logo is the dotted SALESFORCE art, so
+        # the identity is carried by the letter-spaced wordmark + artifact version
+        # below it (the FIGlet BANNER now rides only the plain path).
         block = strip_ansi(sfx.render_banner_block())
-        self.assertIn(sfx.BANNER, block)
         self.assertIn(f"{sfx.BANNER_WORDMARK}   ·   v{self.version}", block)
+        self.assertNotIn(sfx.BANNER, block)                                          # dotted art, not FIGlet
+        self.assertIn(sfx.BANNER, strip_ansi(sfx.render_banner_block(color=False)))  # FIGlet on the plain path
         self.assertNotIn(TAGLINE, block)
         # The plugin counts moved OUT of the logo block into slot 2
         # (render_plugin_summary) — the block is now logo + version only.
@@ -179,19 +182,27 @@ class BannerProvenanceTests(unittest.TestCase):
         self.assertTrue(all(len(line) <= 81 for line in lines), lines)
 
     def test_banner_block_is_colored_by_default_and_plain_under_no_color(self):
-        # The gate is ON now: the SessionStart banner paints with the theme-adaptive
-        # palette (bright-blue lockup, no truecolor), stripping to the plain lockup.
-        # NO_COLOR forces it fully plain (and model-reproduced stdout callers pass
-        # color=False — see render_banner_message).
+        # The gate is ON now: the SessionStart banner paints the dotted SALESFORCE
+        # lockup — a 5-tone 16-color theme-adaptive ramp (gray → blue → bright-blue →
+        # bright-cyan → bright-white, all ANSI palette indices — no truecolor '38;2',
+        # no fixed 256-color '38;5' ramp) so it re-tunes with the host theme. NO_COLOR
+        # forces it fully plain, and the plain path swaps in the ANSI-strippable FIGlet
+        # BANNER (model-reproduced stdout callers pass color=False — see
+        # render_banner_message).
         with mock.patch.dict(os.environ, {}, clear=True):
             block = sfx.render_banner_block()
-        self.assertIn("\x1b[94m", block)               # bright-blue lockup hue
-        self.assertNotIn("\x1b[38;2", block)           # theme-adaptive: no truecolor
-        self.assertIn(sfx.BANNER, strip_ansi(block))
+        self.assertIn("\x1b[90m", block)                 # gray edge specks (theme palette)
+        self.assertIn("\x1b[34m", block)                 # blue (theme palette)
+        self.assertIn("\x1b[94m", block)                 # bright-blue letter bodies (theme palette)
+        self.assertIn("\x1b[96m", block)                 # bright-cyan highlights (theme palette)
+        self.assertIn("\x1b[97m", block)                 # bright-white cores (theme palette)
+        self.assertNotIn("\x1b[38;2", block)             # no truecolor
+        self.assertNotIn("\x1b[38;5;", block)            # no fixed 256-color ramp
+        self.assertNotIn(sfx.BANNER, strip_ansi(block))  # dotted art, not the FIGlet block
         with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
             plain = sfx.render_banner_block()
         self.assertNotIn("\x1b", plain)
-        self.assertIn(sfx.BANNER, plain)
+        self.assertIn(sfx.BANNER, plain)                 # plain path keeps the FIGlet lockup
 
     def test_provenance_fails_open_on_missing_and_damaged_artifacts(self):
         with tempfile.TemporaryDirectory() as td:
@@ -213,7 +224,7 @@ class BannerProvenanceTests(unittest.TestCase):
                     # summary drops entirely (fail-open, never a fabricated zero).
                     self.assertEqual(sfx.render_plugin_summary(False, root, facts=facts), [])
                     block = strip_ansi(sfx.render_banner_block(root))
-                    self.assertIn(sfx.BANNER, block)
+                    self.assertIn(sfx.BANNER_WORDMARK, block)   # dotted logo present on the color path
                     self.assertIn("v?", block)
                     self.assertNotIn(TAGLINE, block)
                     self.assertNotIn("installed", block)
@@ -231,8 +242,8 @@ class BannerProvenanceTests(unittest.TestCase):
             )
             with mock.patch.object(sfx, "_load_plugin_catalog_module", return_value=stub):
                 block = strip_ansi(sfx.render_banner_block(root))
-        self.assertTrue(all(len(line) <= 80 for line in block.splitlines() if line not in sfx._WIDTH_EXEMPT_PLAIN_LINES), block)
-        self.assertIn(sfx.BANNER, block)
+        self.assertTrue(all(sfx._is_width_exempt(line) or len(line) <= 80 for line in block.splitlines()), block)
+        self.assertIn(sfx.BANNER_WORDMARK, block)
 
     def test_degraded_banner_carries_the_same_lockup_and_one_pointer(self):
         # New signature: the caller hands in the lean org line as a band-content
@@ -240,7 +251,7 @@ class BannerProvenanceTests(unittest.TestCase):
         org_group = [[("org: ", "body"), ("none set — /salesforce-development:login", "muted")]]
         raw = sfx.render_degraded_banner(org_group)
         degraded = strip_ansi(raw)
-        self.assertIn(sfx.BANNER, degraded)
+        self.assertIn(sfx.BANNER_WORDMARK, degraded)   # dotted logo present on the color path
         self.assertNotIn(TAGLINE, degraded)
         # Slot 2 rides the degraded path too — a fact about the plugin, not the org.
         self.assertIn(self.plugin_summary_text(), degraded)
@@ -248,7 +259,7 @@ class BannerProvenanceTests(unittest.TestCase):
         # "You don't memorize commands here." mindset line was dropped everywhere.
         self.assertNotIn("You don't memorize commands here.", degraded)
         self.assertEqual(degraded.count("/salesforce-development:discover"), 1)
-        self.assertTrue(all(len(line) <= 80 for line in degraded.splitlines() if line not in sfx._WIDTH_EXEMPT_PLAIN_LINES))
+        self.assertTrue(all(sfx._is_width_exempt(line) or len(line) <= 80 for line in degraded.splitlines()))
 
 
 class EnvironmentBandTests(unittest.TestCase):
@@ -370,7 +381,7 @@ class EnvironmentBandTests(unittest.TestCase):
         org_line = next(l for l in msg.splitlines() if l.startswith("org:"))
         self.assertIn("⚠", org_line)             # the stale path is exercised
         self.assertIn("stale auth", org_line)     # and the signal survives in the edition cell
-        self.assertTrue(all(len(line) <= 80 for line in msg.splitlines() if line not in sfx._WIDTH_EXEMPT_PLAIN_LINES), msg)
+        self.assertTrue(all(sfx._is_width_exempt(line) or len(line) <= 80 for line in msg.splitlines()), msg)
 
     def test_detail_line_omitted_when_org_lacks_instance_and_username(self):
         band = strip_ansi("\n".join(sfx.render_environment_band(
@@ -381,7 +392,7 @@ class EnvironmentBandTests(unittest.TestCase):
     def test_bands_stay_within_eighty_on_absurd_values(self):
         msg = self.message(alias="Z" * 300, edition="E" * 300,
                            instanceUrl="https://" + "x" * 300, username="u" * 300)
-        self.assertTrue(all(len(line) <= 80 for line in msg.splitlines() if line not in sfx._WIDTH_EXEMPT_PLAIN_LINES), msg)
+        self.assertTrue(all(sfx._is_width_exempt(line) or len(line) <= 80 for line in msg.splitlines()), msg)
 
     def test_message_uses_rules_not_boxes(self):
         msg = self.message()
@@ -420,7 +431,10 @@ class EnvironmentBandTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
             plain = sfx.render_banner_message(self.org, self.project, self.stats, "", "connecting")
         self.assertNotIn("\x1b", plain)
-        self.assertEqual(strip_ansi(colored), plain)
+        # The colored logo is the dotted art; the plain logo is the FIGlet BANNER —
+        # they intentionally differ now, so compare the shared region below the wordmark.
+        self.assertEqual(strip_ansi(colored).split(sfx.BANNER_WORDMARK, 1)[1],
+                         plain.split(sfx.BANNER_WORDMARK, 1)[1])
 
     def test_render_banner_message_forces_plain_when_color_false(self):
         # `/status` and `/welcome` print this banner to the model-reproduced stdout
@@ -432,8 +446,10 @@ class EnvironmentBandTests(unittest.TestCase):
             colored = sfx.render_banner_message(self.org, self.project, self.stats, "", "connecting", color=True)
         self.assertNotIn("\x1b", plain)
         self.assertIn("\x1b", colored)              # colored when asked...
-        self.assertNotIn("\x1b[38;2", colored)      # ...with the theme palette, not truecolor
-        self.assertEqual(strip_ansi(colored), plain)
+        self.assertNotIn("\x1b[38;2", colored)      # ...16-color theme-adaptive lockup, not truecolor
+        # Logos differ by path (dotted vs FIGlet); the region below the wordmark matches.
+        self.assertEqual(strip_ansi(colored).split(sfx.BANNER_WORDMARK, 1)[1],
+                         plain.split(sfx.BANNER_WORDMARK, 1)[1])
 
     def test_degraded_bands_keep_lockup_pointer_and_use_rules_not_boxes(self):
         # New signature: the caller hands in the lean org line as a band-content
@@ -447,7 +463,7 @@ class EnvironmentBandTests(unittest.TestCase):
             with self.subTest(case=label):
                 d = strip_ansi(sfx.render_degraded_banner(
                     org_group, project=self.project, stats=self.stats))
-                self.assertIn(sfx.BANNER, d)
+                self.assertIn(sfx.BANNER_WORDMARK, d)   # dotted logo present on the color path
                 self.assertIn("org:", d)
                 # Single ✳ pointer; the old mindset line is gone everywhere.
                 self.assertNotIn("You don't memorize commands here.", d)
@@ -455,7 +471,7 @@ class EnvironmentBandTests(unittest.TestCase):
                 self.assertIn("─" * 64, d)
                 for box_glyph in ("╭", "╰", "│"):
                     self.assertNotIn(box_glyph, d)
-                self.assertTrue(all(len(line) <= 80 for line in d.splitlines() if line not in sfx._WIDTH_EXEMPT_PLAIN_LINES))
+                self.assertTrue(all(sfx._is_width_exempt(line) or len(line) <= 80 for line in d.splitlines()))
 
     def test_degraded_banner_shows_slot_two_but_not_retired_chrome(self):
         # Slot 2 rides the degraded path (it's a plugin fact, not an org fact),
@@ -473,22 +489,24 @@ class EnvironmentBandTests(unittest.TestCase):
         # Mirror the org row's leading "org:" label: the project band leads with
         # "sfdx project:" then the name, in the connected banner and (below) the
         # degraded path. Both labels are lowercase with a trailing colon so the two
-        # deterministic surfaces (banner + journey rail) read identically.
+        # deterministic surfaces (banner + journey nudge) read identically.
         msg = self.message()
         self.assertIn("sfdx project: acme-crm", msg)
         self.assertIn("org: acme-dev", msg)
 
     def test_degraded_banner_carries_the_detected_project_context(self):
         # No org, but a project IS detected — surface where you are: the project
-        # band rides below the org line sharing its divider (one region, three
-        # rules), so the no-org session still shows the local code it can act on.
+        # header rides below the org line sharing its divider (one region), so the
+        # no-org session still names the project. The splash drops the code-inventory
+        # rows and the git line (owner direction) — mid-dev-flow noise; the full
+        # inventory lives on the on-demand /status surface instead.
         org_group = [[("org: ", "body"),
                       ("none set — /salesforce-development:login", "muted")]]
         d = strip_ansi(sfx.render_degraded_banner(
             org_group, project=self.project, stats=self.stats, git_line="4 file(s) changed"))
         self.assertIn("sfdx project: acme-crm", d)        # label precedes project name
-        self.assertIn("Apex 12 src / 8 test", d)           # code inventory row
-        self.assertIn("4 file(s) changed", d)              # git line
+        self.assertNotIn("Apex 12 src / 8 test", d)        # code inventory row dropped
+        self.assertNotIn("4 file(s) changed", d)           # git line dropped
         self.assertEqual(d.splitlines().count("─" * 64), 3)   # shared divider, not doubled
 
     def test_degraded_banner_with_project_context_stays_within_eighty(self):
@@ -501,7 +519,7 @@ class EnvironmentBandTests(unittest.TestCase):
             org_group,
             project={"name": "Z" * 300, "source_api": "9" * 300, "package_dirs": "p" * 300},
             stats=self.stats, git_line="g" * 300))
-        self.assertTrue(all(len(line) <= 80 for line in d.splitlines() if line not in sfx._WIDTH_EXEMPT_PLAIN_LINES), d)
+        self.assertTrue(all(sfx._is_width_exempt(line) or len(line) <= 80 for line in d.splitlines()), d)
 
     def _notice(self):
         # The heading line marks the notice band; the rest is body/spacers.
@@ -521,8 +539,9 @@ class EnvironmentBandTests(unittest.TestCase):
         # never renders as a wider, separately-framed box below everything.
         d = strip_ansi(sfx.render_degraded_banner(
             self._org_group(), notice_lines=self._notice()))
-        logo0 = sfx.BANNER.splitlines()[0]
-        self.assertLess(d.index(logo0), d.index("Telemetry Usage"))       # logo first
+        # The dotted logo carries no FIGlet first line on the color path; anchor on the
+        # wordmark that closes the logo block instead — it still precedes the notice.
+        self.assertLess(d.index(sfx.BANNER_WORDMARK), d.index("Telemetry Usage"))  # logo first
         self.assertLess(d.index("Telemetry Usage"), d.index("none set"))  # notice above the org line
 
     def test_notice_band_shares_rules_and_matches_band_width(self):
@@ -540,7 +559,7 @@ class EnvironmentBandTests(unittest.TestCase):
         for i in range(1, len(lines) - 1):          # never a blank sandwiched by two rules
             if lines[i] == "":
                 self.assertFalse(lines[i - 1] == rule and lines[i + 1] == rule)
-        self.assertTrue(all(len(line) <= 80 for line in lines if line not in sfx._WIDTH_EXEMPT_PLAIN_LINES), d)
+        self.assertTrue(all(sfx._is_width_exempt(line) or len(line) <= 80 for line in lines), d)
 
     def test_notice_band_clips_hostile_lines_within_eighty(self):
         # Notice text is a checked-in constant today, but the band must clip
@@ -548,7 +567,7 @@ class EnvironmentBandTests(unittest.TestCase):
         d = strip_ansi(sfx.render_degraded_banner(
             self._org_group(),
             notice_lines=["H" * 300, "", "b" * 300]))
-        self.assertTrue(all(len(line) <= 80 for line in d.splitlines() if line not in sfx._WIDTH_EXEMPT_PLAIN_LINES), d)
+        self.assertTrue(all(sfx._is_width_exempt(line) or len(line) <= 80 for line in d.splitlines()), d)
 
     def test_connected_banner_weaves_notice_between_install_and_environment(self):
         # On the connected path the notice sits below the install summary, above
@@ -558,7 +577,7 @@ class EnvironmentBandTests(unittest.TestCase):
             org, self.project, self.stats, "", "connecting", notice_lines=self._notice()))
         self.assertLess(d.index("plugin(s) installed"), d.index("Telemetry Usage"))
         self.assertLess(d.index("Telemetry Usage"), d.index("org: acme"))
-        self.assertTrue(all(len(line) <= 80 for line in d.splitlines() if line not in sfx._WIDTH_EXEMPT_PLAIN_LINES), d)
+        self.assertTrue(all(sfx._is_width_exempt(line) or len(line) <= 80 for line in d.splitlines()), d)
 
     def test_banner_without_notice_is_unchanged(self):
         # When no notice is due (notice_lines falsy), neither renderer inserts a
@@ -570,6 +589,36 @@ class EnvironmentBandTests(unittest.TestCase):
         self.assertEqual(
             sfx.render_degraded_banner(self._org_group()),
             sfx.render_degraded_banner(self._org_group(), notice_lines=[]))
+
+    def test_empty_nudge_renders_no_blank_slot(self):
+        # The scaffold paint (and any non-probed startup) hands `render_degraded_banner`
+        # a state but no resolved candidate — nothing cleared the nudge ladder. When the
+        # nudge is empty, the composer must render NOTHING in its place, not a reserved
+        # blank gap. Two proofs: (1) the state-but-no-candidate banner is byte-identical
+        # to the no-state banner (the empty nudge adds no lines), and (2) no doubled
+        # blank line survives anywhere the nudge slot used to reserve.
+        org_group = self._org_group()
+        with_state = sfx.render_degraded_banner(
+            org_group, project=self.project, stats=self.stats, state={}, candidate=None)
+        without_state = sfx.render_degraded_banner(
+            org_group, project=self.project, stats=self.stats, state=None)
+        self.assertEqual(with_state, without_state)
+        lines = strip_ansi(with_state).splitlines()
+        self.assertFalse(
+            any(lines[i] == "" and lines[i + 1] == "" for i in range(len(lines) - 1)),
+            with_state)
+
+    def test_present_nudge_still_rides_below_the_bands(self):
+        # The blank-slot fix must not swallow a real nudge: when a candidate IS
+        # resolved, its two lines (band-labelled message + `→ action`) still render,
+        # separated from the bands above by exactly one blank line.
+        org_group = self._org_group()
+        candidate = mock.Mock(message="Deploy your metadata", action="/salesforce-development:deploy")
+        with mock.patch.object(sfx, "_nudge_band_prefix", return_value="🚀 "):
+            d = strip_ansi(sfx.render_degraded_banner(
+                org_group, project=self.project, stats=self.stats, state={}, candidate=candidate))
+        self.assertIn("🚀 Deploy your metadata", d)
+        self.assertIn("→ /salesforce-development:deploy", d)
 
 
 class SessionStartNoticePlacementTests(unittest.TestCase):
@@ -631,7 +680,7 @@ class SessionStartNoticePlacementTests(unittest.TestCase):
         # "notice above the org guidance" ordering on the org line's own text.
         return {
             "no-default-org": ("", "none set"),
-            "configured-unprobed": ("fixture", "configured, not probed"),
+            "configured-unprobed": ("fixture", "/salesforce-development:status"),
         }
 
     def test_notice_is_visible_only_above_guidance_and_fires_once(self):
@@ -647,10 +696,10 @@ class SessionStartNoticePlacementTests(unittest.TestCase):
                 # Woven into the VISIBLE banner, above the org guidance…
                 self.assertIn("Telemetry Usage", visible)
                 self.assertLess(visible.index("Telemetry Usage"), visible.index(guide))
-                self.assertLessEqual(visible.index(sfx.BANNER.splitlines()[0]), visible.index("Telemetry Usage"))
+                self.assertLessEqual(visible.index(sfx.BANNER_WORDMARK), visible.index("Telemetry Usage"))
                 # …and NEVER in the model-facing context.
                 self.assertNotIn("Telemetry Usage", context)
-                self.assertTrue(all(len(l) <= 80 for l in visible.splitlines() if l not in sfx._WIDTH_EXEMPT_PLAIN_LINES), visible)
+                self.assertTrue(all(sfx._is_width_exempt(l) or len(l) <= 80 for l in visible.splitlines()), visible)
 
     def test_real_gate_fires_notice_once_then_never_again(self):
         # End-to-end through the real telemetry gate (no notice mock): the notice
@@ -702,6 +751,25 @@ class SessionStartPointerTests(unittest.TestCase):
         org_probe.assert_not_called()
         feature_probe.assert_not_called()
 
+    def test_out_of_project_session_start_does_not_flip_welcome(self):
+        # Invariant (owner directive): an out-of-project SessionStart emits a
+        # model-facing note only and returns BEFORE any _record_welcomed, so the
+        # welcome splash flag stays unset — leaving a later `sf project generate`
+        # scaffold paint free to be the session's first visible surface. Only the
+        # project-generate path may flip welcome outside the in-project surfaces.
+        orig_dir = sfx._WELCOME_MARKER_DIR
+        sfx._WELCOME_MARKER_DIR = self.cwd  # no sfdx-project.json here → out of project
+        try:
+            payload = io.StringIO(json.dumps({"source": "startup", "session_id": "oop1"}))
+            out = io.StringIO()
+            with mock.patch.object(sfx.sys, "stdin", payload), redirect_stdout(out):
+                sfx.cmd_detect()
+            result = json.loads(out.getvalue())
+        finally:
+            sfx._WELCOME_MARKER_DIR = orig_dir
+        self.assertNotIn("systemMessage", result)              # model-facing only, no paint
+        self.assertFalse(sfx._welcomed_this_session("oop1"))   # welcome never flipped
+
     def test_connected_project_visible_pointer_without_feature_detector(self):
         self.make_project()
         p1, p2 = self.normal_patches()
@@ -712,10 +780,11 @@ class SessionStartPointerTests(unittest.TestCase):
         self.assert_visible_pointer(result)
         feature_detector.assert_not_called()
 
-    def test_session_start_seeds_the_rail_signature(self):
-        # Decision 2: SessionStart records WHAT rail its banner painted, so a routine
-        # connect right after (no step moved) de-dupes in the wayfinder instead of
-        # repainting an identical rail. Needs a session id (the marker key) and a
+    def test_session_start_seeds_the_nudge_signature(self):
+        # Generalized (journey-nudges Phase 4): SessionStart records a fingerprint
+        # of the WINNING nudge candidate its banner reflected, so a routine connect
+        # right after (no real change) de-dupes in the wayfinder instead of
+        # repainting an identical nudge. Needs a session id (the marker key) and a
         # sandboxed marker dir.
         self.make_project()
         p1, p2 = self.normal_patches()
@@ -730,11 +799,11 @@ class SessionStartPointerTests(unittest.TestCase):
                     mock.patch.object(sfx, "_configured_target_alias", return_value="fixture"), \
                     mock.patch.object(sfx.sys, "stdin", payload), redirect_stdout(out):
                 sfx.cmd_detect()
-            seeded = sfx._last_rail_signature("seed1")
+            seeded = sfx._last_nudge_signature("seed1")
         finally:
             sfx._WELCOME_MARKER_DIR = orig_dir
-        self.assertIsNotNone(seeded)                 # a signature was seeded
-        self.assertIn("Connect:complete", seeded)    # the org is set, so Connect is lit
+        self.assertIsNotNone(seeded)          # a signature was seeded
+        self.assertNotEqual(seeded, "(none)")  # a real candidate fired, not the empty sentinel
 
     def test_visible_session_start_message_opens_with_the_banner_block(self):
         self.make_project()
@@ -760,25 +829,29 @@ class SessionStartPointerTests(unittest.TestCase):
         self.assertTrue(all(len(line) <= 120 for line in context.splitlines()), context)
         self.assertFalse(any(ord(ch) < 32 and ch not in "\n\t" for ch in context))
 
-    def test_session_start_banner_includes_the_position_rail(self):
-        # SessionStart now shows "where you are" (the rail) alongside "what's here"
-        # (the bands). The rail is built from the org already resolved for the bands.
+    def test_session_start_banner_includes_the_nudge_line(self):
+        # journey-nudges Phase 7/8: SessionStart shows "where you are" as the single
+        # ladder-winning graded nudge, replacing the six-label glyph bar (and the
+        # earlier "Reached:" word-list) entirely. This fixture has a configured target
+        # and the project descriptor (Connect/Project reached) but zero local
+        # source, so the empty-scaffold nudge is the ladder winner — a SEV_ROUTINE
+        # momentum nudge, i.e. the 🚀 Try next band.
         self.make_project()
         p1, p2 = self.normal_patches()
         org = {"orgInfo": {"alias": "fixture", "edition": "Developer", "apiVersion": "65.0"}}
-        with p1, p2, mock.patch.object(sfx, "fetch_org_info_via_node", return_value=org):
+        with p1, p2, mock.patch.object(sfx, "fetch_org_info_via_node", return_value=org), \
+                mock.patch.object(sfx, "_configured_target_alias", return_value="fixture"):
             _, result = self.capture_detect()
         visible = strip_ansi(result["systemMessage"])
-        # Rail labels (front-of-journey redesign: Setup left the rail, Project joined).
-        self.assertIn("connect", visible)
-        self.assertIn("project", visible)
-        self.assertIn("build", visible)
-        self.assertIn("observe", visible)                # …through the last label
-        # The visible rail is the signpost only now — the below-rail state summary and
-        # the `likely next` line moved to the model-facing context (asserted at 752).
+        self.assertIn("🚀 Try next:", visible)
+        self.assertIn("generate a component", visible)
+        # The visible surface is the single nudge line only now — no "Reached:"
+        # word-list, and the below-nudge state summary and the `likely next` line
+        # moved to the model-facing context (asserted at 752).
+        self.assertNotIn("Reached:", visible)
         self.assertNotIn("likely next", visible)
         self.assertNotIn("no evidence", visible)
-        self.assertTrue(all(len(l) <= 80 for l in visible.splitlines() if l not in sfx._WIDTH_EXEMPT_PLAIN_LINES))
+        self.assertTrue(all(sfx._is_width_exempt(l) or len(l) <= 80 for l in visible.splitlines()))
 
     def test_no_default_org_visible_pointer(self):
         self.make_project()
@@ -804,7 +877,7 @@ class SessionStartPointerTests(unittest.TestCase):
         self.assertNotIn("state=unreachable", context)
 
     def test_orientation_rule_reaches_the_agent_on_every_session_start_path(self):
-        """An orientation question must reach the rail, not stop at the banner's facts.
+        """An orientation question must reach the nudge, not stop at the banner's facts.
 
         The banner states project and org state, which is a good enough answer for a
         model to stop at — measured: "where am I?" routed 0/4 without this rule. The
@@ -865,14 +938,14 @@ class SessionStartPointerTests(unittest.TestCase):
         for phrase in ("where am I", "what stage", "journey"):
             self.assertIn(phrase, rule)
         self.assertRegex(rule, r"(?i)where is the")
-        self.assertRegex(rule, r"(?i)never answer those with the journey rail")
+        self.assertRegex(rule, r"(?i)never answer those with the journey hints")
         self.assertLessEqual(len(rule.splitlines()), 24)
 
-    def test_orientation_rule_requires_the_rail_and_then_the_model_s_own_read(self):
+    def test_orientation_rule_requires_the_nudge_and_then_the_model_s_own_read(self):
         """The answer is both halves, in order: deterministic grounding, then relevance.
 
-        The rail alone is consistent but inert; prose alone is relevant but drifts
-        run to run and hides the six-stage model. The contract is rail first and
+        The nudge alone is consistent but inert; prose alone is relevant but drifts
+        run to run and hides the six-stage model. The contract is nudge first and
         unmodified, then the model's own short read of what it means here.
         """
         rule = sfx.ORIENTATION_DIRECTIVE
@@ -881,17 +954,17 @@ class SessionStartPointerTests(unittest.TestCase):
         self.assertLess(first, second)
         self.assertRegex(rule[first:second], r"(?i)unmodified")
         # A tool result can be collapsed or absent from what the user reads, so the
-        # rail must be in the reply itself — measured: one run said "that's the
-        # position rail" and shipped an answer containing no rail at all.
+        # nudge must be in the reply itself — measured: one run said "that's the
+        # position nudge" and shipped an answer containing no nudge at all.
         self.assertRegex(rule[first:second], r"(?i)in your reply")
         self.assertRegex(rule[second:], r"(?i)never (restate|replace)")
         self.assertRegex(rule[second:], r"(?i)relevance|means for")
 
-    def test_orientation_rule_defers_when_the_rail_is_already_painted(self):
-        """The paint hook shows the rail in color; the directive must let the model
-        skip reproducing it (else the plain reproduction double-prints the rail)."""
+    def test_orientation_rule_defers_when_the_nudge_is_already_painted(self):
+        """The paint hook shows the nudge in color; the directive must let the model
+        skip reproducing it (else the plain reproduction double-prints the nudge)."""
         rule = sfx.ORIENTATION_DIRECTIVE
-        self.assertRegex(rule, r"(?i)already\s+displayed the rail")   # may wrap
+        self.assertRegex(rule, r"(?i)already\s+displayed the journey hints")   # may wrap
         self.assertRegex(rule, r"(?i)skip this step")
         self.assertLessEqual(len(rule.splitlines()), 24)   # shares the injected-context budget
 
@@ -915,9 +988,9 @@ class SessionStartPointerTests(unittest.TestCase):
         return json.loads(out.getvalue())
 
     def test_in_project_session_start_records_both_welcomed_and_entered(self):
-        # SessionStart paints the banner (logo + rail), so it records BOTH markers:
+        # SessionStart paints the banner (logo + nudge), so it records BOTH markers:
         # `welcomed` (first orientation question won't re-show the logo) and `entered`
-        # (first ordinary prompt won't repaint the rail). Isolate markers in the cwd.
+        # (first ordinary prompt won't repaint the nudge). Isolate markers in the cwd.
         self.make_project()
         p1, p2 = self.normal_patches()
         org = {"orgInfo": {"alias": "fixture", "edition": "Developer", "apiVersion": "65.0"}}
@@ -928,7 +1001,7 @@ class SessionStartPointerTests(unittest.TestCase):
                 self.detect_with_session("sess-A")
             self.assertTrue(sfx._welcomed_this_session("sess-A"))
             self.assertTrue(sfx._entered_this_session("sess-A"))
-            self.assertIsNotNone(sfx._last_rail_signature("sess-A"))
+            self.assertIsNotNone(sfx._last_nudge_signature("sess-A"))
         finally:
             sfx._WELCOME_MARKER_DIR = orig
 
@@ -949,13 +1022,13 @@ class SessionStartPointerTests(unittest.TestCase):
                     sfx.cmd_detect()
             self.assertFalse(sfx._welcomed_this_session("emit-failure"))
             self.assertFalse(sfx._entered_this_session("emit-failure"))
-            self.assertIsNone(sfx._last_rail_signature("emit-failure"))
+            self.assertIsNone(sfx._last_nudge_signature("emit-failure"))
         finally:
             sfx._WELCOME_MARKER_DIR = orig
 
-    def test_session_start_suppresses_the_duplicate_first_message_rail(self):
-        # After SessionStart paints the banner+rail, the first ordinary in-project
-        # prompt must NOT repaint the rail as ambient orientation — that duplicate
+    def test_session_start_suppresses_the_duplicate_first_message_nudge(self):
+        # After SessionStart paints the banner+nudge, the first ordinary in-project
+        # prompt must NOT repaint the nudge as ambient orientation — that duplicate
         # also re-fetched the org. The `entered` marker set by SessionStart is what
         # suppresses it, before any org/journey work runs.
         self.make_project()
@@ -972,10 +1045,125 @@ class SessionStartPointerTests(unittest.TestCase):
                     mock.patch.object(sfx.sys, "stdin", prompt), \
                     mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(out):
                 sfx.cmd_orientation_paint()
-            self.assertEqual(json.loads(out.getvalue()), {"continue": True})   # silent, no duplicate rail
+            self.assertEqual(json.loads(out.getvalue()), {"continue": True})   # silent, no duplicate nudge
             js.assert_not_called()                                             # and no second org fetch
         finally:
             sfx._WELCOME_MARKER_DIR = orig
+
+
+class NudgeAntiNagTests(unittest.TestCase):
+    """Direct proofs of the journey-nudges Phase 4 anti-nag layer: the per-session
+    ~3-distinct-key cap, the rung-1/blocking bypass of BOTH the cap and the
+    wayfinder's fingerprint gate, and the fingerprint-changed-vs-unchanged
+    re-render contract. These operate one layer below
+    `_select_inline_nudge`'s callers (no real rendering surface involved) — a
+    fake `nudge_rules` module (patched via `_load_nudge_rules`) controls exactly
+    which candidate `select()` hands back, while `is_uncapped`/the cap
+    primitives run for real."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.root.joinpath("sfdx-project.json").write_text("{}")
+        self.old_cwd = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, self.old_cwd)
+        orig_dir = sfx._WELCOME_MARKER_DIR
+        sfx._WELCOME_MARKER_DIR = self.root / "markers"
+
+        def _restore():
+            sfx._WELCOME_MARKER_DIR = orig_dir
+        self.addCleanup(_restore)
+        self.state = {"context": {}}
+
+    def candidate(self, dedup_key, evidence_fp="v1", blocking=False):
+        return types.SimpleNamespace(
+            dedup_key=dedup_key, evidence_fp=evidence_fp,
+            severity=(nr.SEV_BLOCKING if blocking else nr.SEV_ROUTINE),
+            confidence=nr.CONFIDENCE_A,
+        )
+
+    def fake_rules(self, pick):
+        # Only `select`/`is_uncapped`/`NudgeInputs` are ever touched by the code
+        # path under test; `is_uncapped` delegates to the REAL predicate so its
+        # rung-1 semantics stay honest even though `select` itself is scripted.
+        return types.SimpleNamespace(
+            select=lambda inputs: pick,
+            is_uncapped=nr.is_uncapped,
+            NudgeInputs=lambda **kw: types.SimpleNamespace(**kw),
+        )
+
+    def select_with(self, pick, session_id):
+        with mock.patch.object(sfx, "_load_nudge_rules", return_value=self.fake_rules(pick)):
+            return sfx._select_inline_nudge(
+                self.state, self.root, None, session_id=session_id, probe_git=False,
+            )
+
+    def test_identical_candidate_on_a_repeat_prompt_does_not_rerender(self):
+        c1 = self.candidate("build.empty-scaffold")
+        sfx._record_nudge_shown("sess-1", c1)
+        self.assertFalse(sfx._nudge_should_render("sess-1", c1))
+
+    def test_evidence_fingerprint_change_triggers_a_rerender(self):
+        c1 = self.candidate("build.empty-scaffold", evidence_fp="v1")
+        sfx._record_nudge_shown("sess-1", c1)
+        c1_changed = self.candidate("build.empty-scaffold", evidence_fp="v2")
+        self.assertTrue(sfx._nudge_should_render("sess-1", c1_changed))
+
+    def test_session_cap_degrades_a_fourth_distinct_key_to_none(self):
+        session_id = "sess-cap"
+        keys = ["connect.no-org", "project.no-git", "build.empty-scaffold"]
+        for key in keys:
+            sfx._record_nudge_shown(session_id, self.candidate(key))
+        self.assertEqual(sorted(sfx._nudge_cap_keys(session_id)), sorted(keys))
+        # A brand-new, non-blocking 4th key has no budget left: the ladder winner
+        # degrades to None rather than earning a Next line.
+        fourth = self.candidate("test.apex-no-tests")
+        self.assertIsNone(self.select_with(fourth, session_id))
+        # An already-capped key may still repeat — re-showing an in-budget nudge
+        # is not a fresh nag.
+        repeat = self.candidate("connect.no-org")
+        self.assertEqual(self.select_with(repeat, session_id), repeat)
+
+    def test_rung_one_blocking_candidate_bypasses_the_cap(self):
+        session_id = "sess-blocker"
+        for key in ("connect.no-org", "project.no-git", "build.empty-scaffold"):
+            sfx._record_nudge_shown(session_id, self.candidate(key))
+        blocker = self.candidate("connect.scratch-expired", blocking=True)
+        # The cap is fully spent on three unrelated keys, yet the live blocker —
+        # a brand-new fourth dedup_key — still renders: "a live fire always earns
+        # its render" (journey-nudges Phase 4 design doc). (connect.scratch-expired,
+        # not connect.unreachable — the latter was rebanded off the blocking rung.)
+        self.assertEqual(self.select_with(blocker, session_id), blocker)
+        # And it never spent a cap slot doing so.
+        self.assertNotIn("connect.scratch-expired", sfx._nudge_cap_keys(session_id))
+
+    def test_rung_one_blocker_respects_the_fingerprint_gate_but_never_starves_on_the_cap(self):
+        # A rung-1 blocker gets exactly ONE bypass: the session cap, inside
+        # `_select_inline_nudge` — it can never be starved by a full 3-key budget.
+        # It does NOT also bypass `_nudge_should_render`'s fingerprint gate: an
+        # unchanged fingerprint still suppresses a repeat render on the wayfinder,
+        # same as any other candidate ("re-render only when the fingerprint
+        # changes... never re-nags" — the design doc states this unconditionally;
+        # "uncapped" is scoped to the cap bullet only). A blocker shows once per
+        # state, not once per prompt.
+        session_id = "sess-blocker-fp"
+        for key in ("connect.no-org", "project.no-git", "build.empty-scaffold"):
+            sfx._record_nudge_shown(session_id, self.candidate(key))
+        blocker = self.candidate("connect.scratch-expired", evidence_fp="v1", blocking=True)
+        # Cap is fully spent on three unrelated keys; the blocker still renders —
+        # never starved — and never spends a cap slot doing so.
+        self.assertEqual(self.select_with(blocker, session_id), blocker)
+        self.assertNotIn("connect.scratch-expired", sfx._nudge_cap_keys(session_id))
+        sfx._record_nudge_shown(session_id, blocker)
+        # Same state, next prompt: the fingerprint is unchanged, so the gate
+        # suppresses the repeat — no re-nag.
+        self.assertFalse(sfx._nudge_should_render(session_id, blocker))
+        # A genuine change (e.g. the underlying evidence shifted) re-earns a
+        # fresh render, exactly like any other candidate.
+        blocker_changed = self.candidate("connect.scratch-expired", evidence_fp="v2", blocking=True)
+        self.assertTrue(sfx._nudge_should_render(session_id, blocker_changed))
 
 
 class CmdStatusStdoutTests(unittest.TestCase):
@@ -1014,16 +1202,19 @@ class CmdStatusStdoutTests(unittest.TestCase):
         self.assertNotIn("\x1b", printed)          # no escape bytes on the reproduced pipe
         self.assertIn("acme-dev", printed)          # the org still renders
         self.assertIn("sfdx project: acme-crm", printed)
-        # The rail rides with /status too — its labels, fully plain (the current-stage
-        # green accent is stripped on this model-reproduced pipe). The below-rail state
-        # summary / `likely next` line is gone from the visible surface.
-        self.assertIn("build", printed)
+        # journey-nudges Phase 7/8: the nudge line rides with /status too, fully plain
+        # (the model-reproduced pipe strips ANSI entirely). This fixture has a
+        # configured org + the project descriptor but no local source, so the
+        # empty-scaffold nudge (🚀 Try next) is the ladder winner; there is no
+        # "Reached:" word-list anymore.
+        self.assertIn("🚀 Try next:", printed)
+        self.assertNotIn("Reached:", printed)
         self.assertNotIn("likely next", printed)
 
     def test_lean_status_drops_logo_and_invitation_but_welcome_keeps_them(self):
         # The `--lean` vs bare split in the `cmd_status` CLI seam: `--lean` drops the
         # HEADLESS logo lockup and the ✳ "New here?" onboarding pointer (keeping the org
-        # / project bands and the journey rail), while bare status keeps the full session
+        # / project bands and the journey nudge), while bare status keeps the full session
         # banner. This is the same logo split the paint layer now expresses directly —
         # `_status_command_paint` renders logo=False, `_welcome_command_paint` logo=True.
         # The /status and /welcome command bodies no longer invoke this CLI (the
@@ -1051,7 +1242,8 @@ class CmdStatusStdoutTests(unittest.TestCase):
         self.assertNotIn("New here?", lean)                # no wayfinding pointer
         self.assertIn("acme-dev", lean)                    # org band kept
         self.assertIn("sfdx project: acme-crm", lean)      # project band kept
-        self.assertIn("build", lean)                       # rail kept
+        self.assertTrue(                                   # graded nudge line kept
+            any(pre in lean for pre in sfx._NUDGE_BAND_PREFIXES), lean)
 
         welcome = run([])                                  # bare `status` (the /welcome path)
         self.assertIn(sfx.BANNER, welcome)                 # logo kept
@@ -1102,7 +1294,7 @@ class WayfinderTests(unittest.TestCase):
         # Self-gate: an ordinary Bash (cd, grep, list, even a deploy) is not an
         # org-connect, so the wayfinder never re-orients — even when the hook fires
         # on it (some Claude Code builds don't honor the plugin.json `if:` matcher,
-        # firing every Bash hook on every command). This is the fix for the rail
+        # firing every Bash hook on every command). This is the fix for the nudge
         # painting after an unrelated command.
         self.make_project()
         for cmd in ("cd /tmp/proj && grep -r foo .", "sf project deploy start",
@@ -1135,7 +1327,7 @@ class WayfinderTests(unittest.TestCase):
         msg = strip_ansi(result["systemMessage"])
         self.assertIn("set a default org", msg)
         self.assertNotIn("additionalContext", json.dumps(result))   # message="" → no model note
-        self.assertTrue(all(len(l) <= 80 for l in msg.splitlines() if l not in sfx._WIDTH_EXEMPT_PLAIN_LINES))
+        self.assertTrue(all(sfx._is_width_exempt(l) or len(l) <= 80 for l in msg.splitlines()))
 
     def test_failed_org_query_emits_a_nudge_and_never_probes(self):
         self.make_project()
@@ -1157,7 +1349,7 @@ class WayfinderTests(unittest.TestCase):
         self.assertIn("not reachable", msg)
         self.assertIn("acme-dev", msg)
         self.assertNotIn("additionalContext", json.dumps(result))
-        self.assertTrue(all(len(l) <= 80 for l in msg.splitlines() if l not in sfx._WIDTH_EXEMPT_PLAIN_LINES))
+        self.assertTrue(all(sfx._is_width_exempt(l) or len(l) <= 80 for l in msg.splitlines()))
 
     def test_connected_reorientation_colored_on_visible_surface_only(self):
         self.make_project()
@@ -1169,15 +1361,17 @@ class WayfinderTests(unittest.TestCase):
             _, result = self.capture()
         visible = result["systemMessage"]
         note = result["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("\x1b[32m", visible)   # current stage greened (the one accent)
+        self.assertIn("\x1b[22m", visible)   # the graded nudge line is colored (body style)
         stripped = strip_ansi(visible)
         self.assertIn("connected", stripped)              # ◆ connected — <org> · … header
         self.assertIn("acme-dev", stripped)               # which org connected
         self.assertNotIn("sfdx project:", stripped)       # heavy bands trimmed away
         self.assertNotIn("Apex 0", stripped)              # inventory band trimmed away
-        self.assertIn("●", stripped)                      # the journey rail glyph row
+        self.assertTrue(                                  # the graded nudge line
+            any(pre in stripped for pre in sfx._NUDGE_BAND_PREFIXES), stripped)
+        self.assertNotIn("Reached:", stripped)            # word-list retired (Phase 8)
         self.assertEqual(stripped.count(POINTER), 1)
-        self.assertTrue(all(len(l) <= 80 for l in stripped.splitlines() if l not in sfx._WIDTH_EXEMPT_PLAIN_LINES), stripped)
+        self.assertTrue(all(sfx._is_width_exempt(l) or len(l) <= 80 for l in stripped.splitlines()), stripped)
         # The model note is ANSI-free and names the NEW target, so the model can
         # correct any "no default org" assumption SessionStart set.
         self.assertNotIn("\x1b", note)
@@ -1203,7 +1397,7 @@ class WayfinderTests(unittest.TestCase):
 
     def test_reorientation_stays_within_eighty_with_maximal_untrusted_names(self):
         # Org alias and project name are attacker-controlled in a clone; the pinned
-        # rail and bands must clip, never soft-wrap out of their ≤80 contract.
+        # nudge and bands must clip, never soft-wrap out of their ≤80 contract.
         self.make_project(name="Z" * 300)
         p1, p2 = self.stat_patches()
         hostile = {**self.org, "alias": "A" * 300, "edition": "E" * 300,
@@ -1214,12 +1408,12 @@ class WayfinderTests(unittest.TestCase):
                 mock.patch.object(sfx, "get_org_display", return_value={"alias": "A" * 300}):
             _, result = self.capture()
         stripped = strip_ansi(result["systemMessage"])
-        self.assertEqual([l for l in stripped.splitlines() if len(l) > 80 and l not in sfx._WIDTH_EXEMPT_PLAIN_LINES], [])
+        self.assertEqual([l for l in stripped.splitlines() if len(l) > 80 and not sfx._is_width_exempt(l)], [])
 
     def test_connect_records_the_flag_so_a_same_turn_journey_paint_dedupes(self):
-        # When the connect PAINTS the rail (here a fresh session — no prior rail seen,
+        # When the connect PAINTS the nudge (here a fresh session — no prior nudge seen,
         # so the step-signature gate treats it as moved), it records the per-turn dedup
-        # flag: a same-turn `discover journey` then de-dupes (at most one rail per turn
+        # flag: a same-turn `discover journey` then de-dupes (at most one nudge per turn
         # across the connect + journey surfaces). Sandbox the marker dir so "fresh" is
         # deterministic — with no recorded signature the wayfinder always paints.
         self.make_project()
@@ -1238,14 +1432,14 @@ class WayfinderTests(unittest.TestCase):
                 sfx.cmd_wayfinder()
             context = sfx._prompt_context(
                 {"session_id": "s1", "prompt_id": "p1"}, rotate_fallback=False)
-            self.assertTrue(sfx._rail_painted_this_turn(context))
-            # A follow-on journey-paint in the same turn now de-dupes (no second rail).
+            self.assertTrue(sfx._nudge_painted_this_turn(context))
+            # A follow-on journey-paint in the same turn now de-dupes (no second nudge).
             jp = io.StringIO(json.dumps({
                 "tool_input": {"command": "sf-context discover journey"},
                 "session_id": "s1", "prompt_id": "p1"}))
             jout = io.StringIO()
             with mock.patch.object(sfx, "_journey_state", return_value=OrientationPaintTests.STATE), \
-                    mock.patch.object(sfx, "_render_journey_rail") as rj, \
+                    mock.patch.object(sfx, "_render_nudge_inline") as rj, \
                     mock.patch.object(sfx.sys, "stdin", jp), redirect_stdout(jout):
                 sfx.cmd_journey_paint()
             self.assertEqual(json.loads(jout.getvalue()), {"continue": True})
@@ -1253,33 +1447,45 @@ class WayfinderTests(unittest.TestCase):
         finally:
             sfx._WELCOME_MARKER_DIR = orig_dir
 
-    def test_rail_signature_is_steps_only_ignoring_the_org_context(self):
-        # The signature is the SIX steps and nothing else — so a connect that only
-        # re-resolves the org (same steps, different header) de-dupes, while a genuine
-        # step move does not. Org context in the state must not perturb it.
-        steps = [{"name": "Connect", "status": "complete"},
-                 {"name": "Build", "status": "current"}]
-        a = {"stages": steps, "context": {"orgAlias": "acme-dev", "orgStatus": "reachable"}}
-        b = {"stages": [dict(s) for s in steps],
-             "context": {"orgAlias": "other-org", "orgStatus": "unreachable"}}
-        self.assertEqual(sfx._rail_signature(a), sfx._rail_signature(b))
-        moved = {"stages": [{"name": "Connect", "status": "complete"},
-                            {"name": "Build", "status": "complete"}]}
-        self.assertNotEqual(sfx._rail_signature(a), sfx._rail_signature(moved))
+    def test_nudge_signature_is_dedup_key_and_evidence_fp_only(self):
+        # Generalized (journey-nudges Phase 4): the signature keys ONLY on the
+        # winning candidate's (dedup_key, evidence_fp) — so two candidates that
+        # differ in every other field (message, severity, stage) but share both
+        # still dedupe, while a genuinely different dedup_key never does. This is
+        # what makes an org-context-only refresh (same real-world gap, re-resolved
+        # org) de-dupe while an actual gap closing does not.
+        a = types.SimpleNamespace(
+            dedup_key="deploy.never-deployed", evidence_fp="",
+            message="stale message", severity=1,
+        )
+        b = types.SimpleNamespace(
+            dedup_key="deploy.never-deployed", evidence_fp="",
+            message="a completely different message", severity=3,
+        )
+        self.assertEqual(sfx._nudge_signature(a), sfx._nudge_signature(b))
+        moved = types.SimpleNamespace(dedup_key="connect.unreachable", evidence_fp="acme-dev")
+        self.assertNotEqual(sfx._nudge_signature(a), sfx._nudge_signature(moved))
 
-    def test_connect_with_unchanged_steps_shows_header_but_not_a_second_rail(self):
-        # The reported bug, wayfinder side: the last rail the user saw had these exact
+    def test_connect_with_unchanged_steps_shows_header_but_not_a_second_nudge(self):
+        # The reported bug, wayfinder side: the last nudge the user saw had these exact
         # steps, so a connect that re-resolves the same org moves nothing — show the
-        # connected-org header (real news), but NOT a duplicate rail.
+        # connected-org header (real news), but NOT a duplicate nudge.
         self.make_project()
         p1, p2 = self.stat_patches()
         orig_dir = sfx._WELCOME_MARKER_DIR
         sfx._WELCOME_MARKER_DIR = self.cwd
         try:
-            seen = sfx._derive_journey_state(self.cwd.resolve(), has_project=True,
-                                             target="acme-dev", target_error=None,
-                                             org_display=self.org)
-            sfx._record_rail_signature("sess-x", seen)
+            # Seed the same candidate cmd_wayfinder will independently re-derive
+            # below (same project/org facts) — mirroring the real call site
+            # (root, state, org, session_id) so the anti-nag fingerprint dedupes.
+            root = self.cwd.resolve()
+            seen_state = sfx._derive_journey_state(root, has_project=True,
+                                                    target="acme-dev", target_error=None,
+                                                    org_display=self.org)
+            seen_candidate = sfx._select_inline_nudge(
+                seen_state, root, self.org, session_id="sess-x",
+            )
+            sfx._record_nudge_signature("sess-x", seen_candidate)
             payload = io.StringIO(json.dumps({
                 "tool_input": {"command": "sf config set target-org acme-dev"},
                 "session_id": "sess-x"}))
@@ -1291,31 +1497,33 @@ class WayfinderTests(unittest.TestCase):
                     mock.patch.object(sfx.sys, "stdin", payload), redirect_stdout(out):
                 sfx.cmd_wayfinder()
             result = json.loads(out.getvalue())
-            painted_flag = sfx._rail_painted_this_turn("sess-x")
+            painted_flag = sfx._nudge_painted_this_turn("sess-x")
         finally:
             sfx._WELCOME_MARKER_DIR = orig_dir
         stripped = strip_ansi(result["systemMessage"])
         self.assertIn("connected", stripped)          # header still shows — the connect is real news
         self.assertIn("acme-dev", stripped)
         self.assertNotIn("●", stripped)                # but no second rail glyph row
-        self.assertNotIn("likely next", stripped)      # nor the rail's next-step line
+        self.assertNotIn("likely next", stripped)      # nor the nudge's next-step line
         self.assertEqual(stripped.count(POINTER), 1)    # the pointer still closes it
-        # A suppressed rail must not consume the turn's single-rail budget, so a later
+        # A suppressed nudge must not consume the turn's single-nudge budget, so a later
         # solicited "where am I" this turn could still paint.
         self.assertFalse(painted_flag)
 
-    def test_connect_that_lights_a_step_reprints_the_rail(self):
+    def test_connect_that_lights_a_step_reprints_the_nudge(self):
         # The reprint-on-change half: when the connect genuinely moves a step (here the
-        # last rail the user saw had Connect NOT yet lit), the rail reprints and the
+        # last nudge the user saw had Connect NOT yet lit), the nudge reprints and the
         # signature advances.
         self.make_project()
         p1, p2 = self.stat_patches()
         orig_dir = sfx._WELCOME_MARKER_DIR
         sfx._WELCOME_MARKER_DIR = self.cwd
         try:
-            stale = {"stages": [{"name": n, "status": "future"} for n in (
-                "Connect", "Project", "Build", "Test", "Deploy", "Observe")]}
-            sfx._record_rail_signature("sess-y", stale)
+            # A stale prior signature standing in for "no org connected yet" — a
+            # dedup_key the real post-connect candidate below can never share, so
+            # the fingerprint change forces a reprint.
+            stale_candidate = types.SimpleNamespace(dedup_key="connect.no-org", evidence_fp="")
+            sfx._record_nudge_signature("sess-y", stale_candidate)
             payload = io.StringIO(json.dumps({
                 "tool_input": {"command": "sf org login web --set-default"},
                 "session_id": "sess-y", "prompt_id": "p1"}))
@@ -1327,22 +1535,23 @@ class WayfinderTests(unittest.TestCase):
                     mock.patch.object(sfx.sys, "stdin", payload), redirect_stdout(out):
                 sfx.cmd_wayfinder()
             result = json.loads(out.getvalue())
-            recorded = sfx._last_rail_signature("sess-y")
+            recorded = sfx._last_nudge_signature("sess-y")
             context = sfx._prompt_context(
                 {"session_id": "sess-y", "prompt_id": "p1"}, rotate_fallback=False)
-            painted_flag = sfx._rail_painted_this_turn(context)
+            painted_flag = sfx._nudge_painted_this_turn(context)
         finally:
             sfx._WELCOME_MARKER_DIR = orig_dir
         stripped = strip_ansi(result["systemMessage"])
-        self.assertIn("●", stripped)                              # the rail reprinted
+        self.assertTrue(                                          # the nudge reprinted
+            any(pre in stripped for pre in sfx._NUDGE_BAND_PREFIXES), stripped)
         self.assertIn("connected", stripped)
-        self.assertNotEqual(recorded, sfx._rail_signature(stale))  # signature advanced off the stale one
+        self.assertNotEqual(recorded, sfx._nudge_signature(stale_candidate))  # advanced off the stale one
         self.assertTrue(painted_flag)                              # counted as a paint (dedupes a follow-on)
 
-    def test_orientation_then_same_state_connect_paints_the_rail_once(self):
+    def test_orientation_then_same_state_connect_paints_the_nudge_once(self):
         # End-to-end regression for the reported bug: `/cd` into a project, ask
-        # "what's next" (rail on UserPromptSubmit), then the model sets the SAME target
-        # org (wayfinder on PostToolUse). Feature B painted the rail BOTH times; the
+        # "what's next" (nudge on UserPromptSubmit), then the model sets the SAME target
+        # org (wayfinder on PostToolUse). Feature B painted the nudge BOTH times; the
         # step-signature gate makes the second an org-header only.
         self.make_project()
         p1, p2 = self.stat_patches()
@@ -1362,7 +1571,7 @@ class WayfinderTests(unittest.TestCase):
                     mock.patch.dict(os.environ, {}, clear=True), \
                     mock.patch.object(sfx.sys, "stdin", ups), redirect_stdout(ups_out):
                 sfx.cmd_orientation_paint()
-            rail1 = strip_ansi(json.loads(ups_out.getvalue())["systemMessage"])
+            nudge1 = strip_ansi(json.loads(ups_out.getvalue())["systemMessage"])
 
             wf = io.StringIO(json.dumps({
                 "tool_input": {"command": "sf config set target-org acme-dev"},
@@ -1374,18 +1583,23 @@ class WayfinderTests(unittest.TestCase):
                     mock.patch.object(sfx, "get_org_display", return_value={"alias": "acme-dev"}), \
                     mock.patch.object(sfx.sys, "stdin", wf), redirect_stdout(wf_out):
                 sfx.cmd_wayfinder()
-            rail2 = strip_ansi(json.loads(wf_out.getvalue())["systemMessage"])
+            nudge2 = strip_ansi(json.loads(wf_out.getvalue())["systemMessage"])
         finally:
             sfx._WELCOME_MARKER_DIR = orig_dir
-        self.assertIn("●", rail1)          # rail #1 painted (the solicited orientation)
-        self.assertIn("connected", rail2)  # the connect still confirms the org
-        self.assertNotIn("●", rail2)       # but there is no second rail
+        # journey-nudges Phase 7/8: nudge #1 (the solicited orientation) painted the
+        # single graded nudge line; the glyph rail and the "Reached:" word-list are
+        # both gone, so check for the nudge content instead of the old "●" marker.
+        self.assertTrue(any(pre in nudge1 for pre in sfx._NUDGE_BAND_PREFIXES), nudge1)
+        self.assertNotIn("Reached:", nudge1)
+        self.assertIn("connected", nudge2)  # the connect still confirms the org
+        # …but there is no second nudge line (the same-turn dedup gate suppressed it).
+        self.assertFalse(any(pre in nudge2 for pre in sfx._NUDGE_BAND_PREFIXES), nudge2)
 
 
 class OrientationPaintTests(unittest.TestCase):
-    """The UserPromptSubmit paint hook: on an orientation question the journey rail
+    """The UserPromptSubmit paint hook: on an orientation question the journey nudge
     rides the color-carrying systemMessage channel (the one pipe that can, like the
-    banner), and the model gets a plain note saying the rail is already shown so it
+    banner), and the model gets a plain note saying the nudge is already shown so it
     adds only its read. Silent on every other prompt; fails open."""
 
     # A realistic reducer output on the new cyclical taxonomy: project + reachable
@@ -1401,9 +1615,9 @@ class OrientationPaintTests(unittest.TestCase):
     }
 
     def setUp(self):
-        # These tests exercise Side B's steady state — the in-project rail. Run from
+        # These tests exercise Side B's steady state — the in-project nudge. Run from
         # inside a project, and mark the logo already shown this session (session
-        # "s1", the id capture() uses) so the hook paints the rail, not the
+        # "s1", the id capture() uses) so the hook paints the nudge, not the
         # once-per-scenario welcome. The first-time welcome has its own test.
         self.tmp = tempfile.TemporaryDirectory()
         self.old_cwd = Path.cwd()
@@ -1411,7 +1625,7 @@ class OrientationPaintTests(unittest.TestCase):
         Path("sfdx-project.json").write_text("{}")
         # Session markers live in the temp dir (not cwd), so isolate + clean them.
         # Steady state: logo already shown AND the project already "entered", so
-        # orientation questions paint the rail and other prompts stay silent. The
+        # orientation questions paint the nudge and other prompts stay silent. The
         # first-message (entered) nudge has its own test.
         self._orig_marker_dir = sfx._WELCOME_MARKER_DIR
         self._orig_runtime_dir = sfx._PROMPT_RUNTIME_DIR
@@ -1439,7 +1653,7 @@ class OrientationPaintTests(unittest.TestCase):
         sfx._session_marker("s1", "welcome").unlink(missing_ok=True)   # scenario's first orientation
         # The first-surface welcome now paints the full banner chrome, resolving the
         # org via _resolve_position_and_org for its org band — so mock that alongside
-        # _journey_state (the bare-rail second turn still reads _journey_state).
+        # _journey_state (the bare-nudge second turn still reads _journey_state).
         org = {"alias": "acme-dev", "edition": "Developer Edition (Sandbox)",
                "apiVersion": "67.0", "instanceUrl": "https://x.my.salesforce.com",
                "username": "u@example.com"}
@@ -1448,9 +1662,11 @@ class OrientationPaintTests(unittest.TestCase):
             _, first = self.capture("where am i?")
             _, second = self.capture("where am i?")
         # The lockup is colored on the systemMessage channel, so match the stripped form.
-        self.assertIn(sfx.BANNER, strip_ansi(first["systemMessage"]))       # logo carried once
-        self.assertNotIn(sfx.BANNER, strip_ansi(second["systemMessage"]))   # rail only thereafter
-        self.assertIn("build", second["systemMessage"])         # still the rail
+        self.assertIn(sfx.BANNER_WORDMARK, strip_ansi(first["systemMessage"]))       # logo carried once
+        self.assertNotIn(sfx.BANNER_WORDMARK, strip_ansi(second["systemMessage"]))   # nudge line only thereafter
+        self.assertTrue(                                                    # still the nudge line
+            any(pre in second["systemMessage"] for pre in sfx._NUDGE_BAND_PREFIXES),
+            second["systemMessage"])
 
     def capture(self, prompt, env=None):
         payload = io.StringIO(json.dumps({"prompt": prompt, "session_id": "s1"}))
@@ -1509,17 +1725,27 @@ class OrientationPaintTests(unittest.TestCase):
                      "", "x" * 3000):
             self.assertFalse(sfx._is_status_question(miss), miss)
 
-    def test_status_question_paints_org_and_project_bands_plus_rail(self):
+    def test_status_question_paints_org_and_project_bands_plus_nudge_line(self):
         code, result = self.capture_status("what's the status of the project")
         self.assertEqual(code, 0)
         sysmsg = result["systemMessage"]
         stripped = strip_ansi(sysmsg)
         self.assertIn("org: acme-dev", stripped)             # the org band
         self.assertIn("sfdx project: acme-crm", stripped)    # the project band
-        self.assertIn("build", stripped)                     # the rail labels
-        self.assertNotIn("likely next", stripped)            # …but no below-rail next-step line
-        self.assertIn("\x1b[32m", sysmsg)        # current stage greened (systemMessage keeps it)
-        self.assertTrue(all(len(l) <= 80 for l in stripped.splitlines() if l not in sfx._WIDTH_EXEMPT_PLAIN_LINES))
+        # journey-nudges Phase 7/8: the glyph rail's labels and the "Reached:"
+        # word-list are retired — the single ladder-winning graded nudge line paints
+        # instead (this sandbox has Apex without tests → the ⚠️ Heads up apex-no-tests
+        # winner; assert the band marker generically so the test tracks "a nudge line
+        # rides here", not one specific rule).
+        self.assertTrue(
+            any(pre in stripped for pre in sfx._NUDGE_BAND_PREFIXES), stripped)
+        self.assertNotIn("Reached:", stripped)
+        self.assertNotIn("likely next", stripped)            # …but no below-nudge next-step line
+        # The glyph rail's single green "current stage" accent is retired along
+        # with the geometry — the nudge line paints via the theme-adaptive
+        # palette instead (undimmed body text), not a hardcoded green.
+        self.assertIn("\x1b[22m", sysmsg)
+        self.assertTrue(all(sfx._is_width_exempt(l) or len(l) <= 80 for l in stripped.splitlines()))
         note = result["hookSpecificOutput"]["additionalContext"]
         self.assertNotIn("\x1b", note)                       # model note is plain
         self.assertRegex(note, r"(?i)do not reproduce")
@@ -1530,9 +1756,10 @@ class OrientationPaintTests(unittest.TestCase):
         code, result = self.capture_status("status", org=None)
         stripped = strip_ansi(result["systemMessage"])
         self.assertIn("sfdx project: acme-crm", stripped)    # project band still shows
-        self.assertIn("build", stripped)                     # rail still shows
+        self.assertTrue(                                     # nudge line still shows
+            any(pre in stripped for pre in sfx._NUDGE_BAND_PREFIXES), stripped)
         self.assertNotIn("org: acme-dev", stripped)          # no fabricated connected org
-        self.assertTrue(all(len(l) <= 80 for l in stripped.splitlines() if l not in sfx._WIDTH_EXEMPT_PLAIN_LINES))
+        self.assertTrue(all(sfx._is_width_exempt(l) or len(l) <= 80 for l in stripped.splitlines()))
 
     def test_status_surface_reports_cli_unknown_honestly(self):
         # When the CLI can't be resolved or the org query failed (orgStatus
@@ -1549,16 +1776,21 @@ class OrientationPaintTests(unittest.TestCase):
         self.assertIn("Salesforce CLI", surface)
         self.assertNotIn("no default set", surface)
 
-    def test_positional_question_paints_rail_only_not_the_bands(self):
-        # "what's next" is positional — the rail (with its one-line context row),
-        # never the rule-framed org/project bands. The rail's context row does state
-        # the project/org, so the band-only markers are the discriminator: the MCP
-        # line and the Apex-inventory counts appear only when the status bands paint.
+    def test_positional_question_paints_nudge_only_not_the_bands(self):
+        # "what's next" is positional — the single graded nudge line (with its
+        # one-line context row), never the rule-framed org/project bands. The
+        # context row does state the project/org, so the band-only markers are
+        # the discriminator: the MCP line and the Apex-inventory counts appear
+        # only when the status bands paint.
         _, result = self.capture("what's next")
         stripped = strip_ansi(result["systemMessage"])
-        self.assertIn("build", stripped)                     # the rail
+        self.assertIn("🚀 Try next:", stripped)              # the empty-scaffold nudge line
         self.assertNotIn("MCP:", stripped)                   # NOT the org band
-        self.assertNotIn("Apex ", stripped)                  # NOT the project inventory band
+        # NOT the project inventory band — its "Apex N src / M test" count line.
+        # (The empty-scaffold nudge's own action text legitimately mentions
+        # "Apex class" as an example, so match the inventory band's distinguishing
+        # "src /" marker instead of a bare "Apex " substring.)
+        self.assertNotIn("src /", stripped)
 
     def test_ordinary_prompt_does_no_org_or_filesystem_fetch(self):
         # The hot path: an ordinary, already-entered prompt paints nothing AND does
@@ -1578,23 +1810,25 @@ class OrientationPaintTests(unittest.TestCase):
         rp.assert_not_called()
         gto.assert_not_called()
 
-    def test_first_in_project_message_paints_the_rail_once_as_ambient(self):
+    def test_first_in_project_message_paints_the_nudge_once_as_ambient(self):
         # First non-orientation, non-connect message after entering the project →
-        # the position rail paints once, as AMBIENT orientation (the note tells the
+        # the position nudge paints once, as AMBIENT orientation (the note tells the
         # model to proceed with the request, not to orient). Silent on the next.
         sfx._session_marker("s1", "entered").unlink(missing_ok=True)
         _, first = self.capture("create a custom object")
         _, second = self.capture("add a field to it")
-        self.assertIn("build", first["systemMessage"])             # the rail is shown
+        self.assertTrue(                                                     # the nudge line
+            any(pre in first["systemMessage"] for pre in sfx._NUDGE_BAND_PREFIXES),
+            first["systemMessage"])
         note = first["hookSpecificOutput"]["additionalContext"]
         self.assertRegex(note, r"(?i)ambient")
         self.assertRegex(note, r"(?i)proceed with")
         self.assertEqual(second, {"continue": True})               # once only
 
-    def test_prompt_plugin_recommendation_defers_but_does_not_consume_ambient_rail(self):
+    def test_prompt_plugin_recommendation_defers_but_does_not_consume_ambient_nudge(self):
         # A first-turn recommendation owns that turn's visible surface. It must not
-        # permanently consume the first-message orientation rail: the proposal
-        # ledger dedupes the plugin on turn two, which then paints the ambient rail.
+        # permanently consume the first-message orientation nudge: the proposal
+        # ledger dedupes the plugin on turn two, which then paints the ambient nudge.
         sfx._session_marker("s1", "entered").unlink(missing_ok=True)
         candidate = {
             "name": "experience-cms",
@@ -1613,7 +1847,9 @@ class OrientationPaintTests(unittest.TestCase):
 
             _, next_turn = self.capture("show me the results")
 
-        self.assertIn("build", next_turn["systemMessage"])
+        self.assertTrue(
+            any(pre in next_turn["systemMessage"] for pre in sfx._NUDGE_BAND_PREFIXES),
+            next_turn["systemMessage"])
         note = next_turn["hookSpecificOutput"]["additionalContext"]
         self.assertRegex(note, r"(?i)ambient")
         self.assertTrue(sfx._entered_this_session("s1"))
@@ -1858,7 +2094,7 @@ class OrientationPaintTests(unittest.TestCase):
         # D9: on connect intent the plugin does the cheap `sf`-on-PATH check FIRST.
         # capture() clears the env, so `sf` is not resolvable → the note routes to
         # environment setup and explicitly does NOT attempt an interactive login (the
-        # plugin never runs `sf org login`). It marks entered (so the ambient rail
+        # plugin never runs `sf org login`). It marks entered (so the ambient nudge
         # won't also fire) and paints nothing — model-facing additionalContext only.
         sfx._session_marker("s1", "entered").unlink(missing_ok=True)
         _, result = self.capture("connect an org")
@@ -1911,14 +2147,14 @@ class OrientationPaintTests(unittest.TestCase):
         # "what can I do here?" is a capability-catalog question. The overview is a
         # Tier-1 surface (like the SessionStart banner): the plugin paints the block
         # on the visible channel and the model adds only its read — it never reproduces
-        # it. The ambient rail steps aside (entered is marked) and is NOT drawn here.
+        # it. The ambient nudge steps aside (entered is marked) and is NOT drawn here.
         sfx._session_marker("s1", "entered").unlink(missing_ok=True)
         block = "Salesforce Headless 360 · what you can do here\n(fixed test block)"
         with mock.patch.object(sfx, "_render_overview_paint", return_value=block) as rp:
             _, result = self.capture("what can I do here?")
         rp.assert_called_once()
         self.assertEqual(result["systemMessage"], "\n" + block)   # painted directly, verbatim
-        self.assertNotIn("build", result["systemMessage"])        # the overview, NOT the rail
+        self.assertNotIn("build", result["systemMessage"])        # the overview, NOT the nudge
         note = result["hookSpecificOutput"]["additionalContext"]
         self.assertNotIn("\x1b", note)                            # model note is plain
         self.assertRegex(note, r"(?i)do not reproduce")
@@ -1945,7 +2181,7 @@ class OrientationPaintTests(unittest.TestCase):
 
     def test_failed_overview_render_leaves_entered_absent_and_ambient_retries(self):
         # A failed overview paint did not show the suppressing surface. Keep `entered`
-        # absent so the next ordinary prompt can still deliver the ambient rail.
+        # absent so the next ordinary prompt can still deliver the ambient nudge.
         sfx._session_marker("s1", "entered").unlink(missing_ok=True)
         with mock.patch.object(sfx, "_render_overview_paint", return_value=None):
             _, failed = self.capture("what are my options")
@@ -1953,11 +2189,13 @@ class OrientationPaintTests(unittest.TestCase):
         self.assertFalse(sfx._entered_this_session("s1"))
 
         _, retry = self.capture("add a field to Account")
-        self.assertIn("build", retry["systemMessage"])
+        self.assertTrue(
+            any(pre in retry["systemMessage"] for pre in sfx._NUDGE_BAND_PREFIXES),
+            retry["systemMessage"])
         self.assertTrue(sfx._entered_this_session("s1"))
 
     def test_status_render_failure_leaves_shown_state_absent(self):
-        for kind in ("welcome", "entered", "railsig"):
+        for kind in ("welcome", "entered", "nudgesig"):
             sfx._session_marker("s1", kind).unlink(missing_ok=True)
         with mock.patch.object(
             sfx, "render_status_surface", side_effect=RuntimeError("render failed")
@@ -1966,17 +2204,17 @@ class OrientationPaintTests(unittest.TestCase):
         self.assertEqual(result, {"continue": True})
         self.assertFalse(sfx._welcomed_this_session("s1"))
         self.assertFalse(sfx._entered_this_session("s1"))
-        self.assertIsNone(sfx._last_rail_signature("s1"))
-        self.assertFalse(sfx._rail_painted_this_turn("s1"))
+        self.assertIsNone(sfx._last_nudge_signature("s1"))
+        self.assertFalse(sfx._nudge_painted_this_turn("s1"))
 
     def _clear_shown_state(self):
-        for kind in ("welcome", "entered", "railsig"):
+        for kind in ("welcome", "entered", "nudgesig"):
             sfx._session_marker("s1", kind).unlink(missing_ok=True)
 
     def _assert_no_shown_state(self):
         self.assertFalse(sfx._welcomed_this_session("s1"))
         self.assertFalse(sfx._entered_this_session("s1"))
-        self.assertIsNone(sfx._last_rail_signature("s1"))
+        self.assertIsNone(sfx._last_nudge_signature("s1"))
 
     def test_status_emit_failure_commits_no_markers_and_status_can_retry(self):
         self._clear_shown_state()
@@ -1989,7 +2227,7 @@ class OrientationPaintTests(unittest.TestCase):
         self.assertIn("systemMessage", retry)
         self.assertTrue(sfx._welcomed_this_session("s1"))
         self.assertTrue(sfx._entered_this_session("s1"))
-        self.assertIsNotNone(sfx._last_rail_signature("s1"))
+        self.assertIsNotNone(sfx._last_nudge_signature("s1"))
 
     def test_overview_emit_failure_commits_no_markers_and_overview_can_retry(self):
         self._clear_shown_state()
@@ -2004,7 +2242,7 @@ class OrientationPaintTests(unittest.TestCase):
         self.assertEqual(retry["systemMessage"], "\noverview")
         self.assertTrue(sfx._entered_this_session("s1"))
         self.assertFalse(sfx._welcomed_this_session("s1"))
-        self.assertIsNone(sfx._last_rail_signature("s1"))
+        self.assertIsNone(sfx._last_nudge_signature("s1"))
 
     def test_environment_emit_failure_commits_no_markers_and_environment_can_retry(self):
         self._clear_shown_state()
@@ -2017,7 +2255,7 @@ class OrientationPaintTests(unittest.TestCase):
         self.assertIn("additionalContext", retry["hookSpecificOutput"])
         self.assertTrue(sfx._entered_this_session("s1"))
         self.assertFalse(sfx._welcomed_this_session("s1"))
-        self.assertIsNone(sfx._last_rail_signature("s1"))
+        self.assertIsNone(sfx._last_nudge_signature("s1"))
 
     def test_connect_emit_failure_commits_no_markers_and_connect_can_retry(self):
         self._clear_shown_state()
@@ -2042,10 +2280,10 @@ class OrientationPaintTests(unittest.TestCase):
         self.assertIn("additionalContext", retry["hookSpecificOutput"])
         self.assertTrue(sfx._entered_this_session("s1"))
         self.assertFalse(sfx._welcomed_this_session("s1"))
-        self.assertIsNone(sfx._last_rail_signature("s1"))
+        self.assertIsNone(sfx._last_nudge_signature("s1"))
 
     def test_orientation_state_failure_leaves_shown_state_absent(self):
-        for kind in ("welcome", "entered", "railsig"):
+        for kind in ("welcome", "entered", "nudgesig"):
             sfx._session_marker("s1", kind).unlink(missing_ok=True)
         with mock.patch.object(
             sfx, "_resolve_position_and_org", side_effect=RuntimeError("state failed")
@@ -2054,34 +2292,34 @@ class OrientationPaintTests(unittest.TestCase):
         self.assertEqual(result, {"continue": True})
         self.assertFalse(sfx._welcomed_this_session("s1"))
         self.assertFalse(sfx._entered_this_session("s1"))
-        self.assertIsNone(sfx._last_rail_signature("s1"))
-        self.assertFalse(sfx._rail_painted_this_turn("s1"))
+        self.assertIsNone(sfx._last_nudge_signature("s1"))
+        self.assertFalse(sfx._nudge_painted_this_turn("s1"))
 
     def test_orientation_emit_failure_keeps_claim_but_commits_no_shown_state(self):
         # The at-most-once claim intentionally stays before emit. An emit failure may
-        # consume that prompt's rail, but it must not commit session shown-state.
-        for kind in ("welcome", "entered", "railsig"):
+        # consume that prompt's nudge, but it must not commit session shown-state.
+        for kind in ("welcome", "entered", "nudgesig"):
             sfx._session_marker("s1", kind).unlink(missing_ok=True)
         with mock.patch.object(sfx, "emit", side_effect=RuntimeError("emit failed")):
             _, result = self.capture("where am I?")
         self.assertEqual(result, {"continue": True})
-        self.assertTrue(sfx._rail_painted_this_turn("s1"))
+        self.assertTrue(sfx._nudge_painted_this_turn("s1"))
         self.assertFalse(sfx._welcomed_this_session("s1"))
         self.assertFalse(sfx._entered_this_session("s1"))
-        self.assertIsNone(sfx._last_rail_signature("s1"))
+        self.assertIsNone(sfx._last_nudge_signature("s1"))
 
     def test_prompt_claim_loss_commits_no_shown_state_or_signature(self):
-        for kind in ("welcome", "entered", "railsig"):
+        for kind in ("welcome", "entered", "nudgesig"):
             sfx._session_marker("s1", kind).unlink(missing_ok=True)
-        with mock.patch.object(sfx, "_claim_prompt_rail", return_value=False):
+        with mock.patch.object(sfx, "_claim_prompt_nudge", return_value=False):
             _, result = self.capture("where am I?")
         self.assertEqual(result, {"continue": True})
         self.assertFalse(sfx._welcomed_this_session("s1"))
         self.assertFalse(sfx._entered_this_session("s1"))
-        self.assertIsNone(sfx._last_rail_signature("s1"))
+        self.assertIsNone(sfx._last_nudge_signature("s1"))
 
     def test_successful_orientation_orders_claim_emit_then_shown_state(self):
-        for kind in ("welcome", "entered", "railsig"):
+        for kind in ("welcome", "entered", "nudgesig"):
             sfx._session_marker("s1", kind).unlink(missing_ok=True)
         events = []
         org = {"alias": "acme-dev", "edition": "Developer", "apiVersion": "65.0"}
@@ -2097,7 +2335,7 @@ class OrientationPaintTests(unittest.TestCase):
                     sfx, "_render_getting_started_welcome",
                     side_effect=lambda *_args, **_kwargs: events.append("render") or "surface"), \
                 mock.patch.object(
-                    sfx, "_claim_prompt_rail",
+                    sfx, "_claim_prompt_nudge",
                     side_effect=lambda _context: events.append("claim") or True), \
                 mock.patch.object(sfx, "emit", side_effect=successful_emit), \
                 mock.patch.object(
@@ -2105,8 +2343,8 @@ class OrientationPaintTests(unittest.TestCase):
                 mock.patch.object(
                     sfx, "_record_welcomed", side_effect=lambda _sid: events.append("welcomed")), \
                 mock.patch.object(
-                    sfx, "_record_rail_signature",
-                    side_effect=lambda _sid, _state: events.append("signature")):
+                    sfx, "_record_nudge_shown",
+                    side_effect=lambda _sid, _candidate: events.append("signature")):
             self.capture("where am I?")
         self.assertEqual(events, [
             "gather", "render", "claim", "emit", "entered", "welcomed", "signature",
@@ -2125,7 +2363,7 @@ class OrientationPaintTests(unittest.TestCase):
         self.assertIn("what you can do here", plain)
         self.assertIn("INSTALLED", plain)
         self.assertIn("AVAILABLE TO ADD", plain)
-        # The overview is EXEMPT from the ≤80 alignment lockup the rail/readiness/box
+        # The overview is EXEMPT from the ≤80 alignment lockup the nudge/readiness/box
         # surfaces keep — it is a plain name+blurb list with no columns to align, so
         # (like the readiness detail row) it runs at its own generous measure. Rows are
         # bounded by _OVERVIEW_ROW_WIDTH, not 80. The hook cannot read the real terminal
@@ -2236,9 +2474,8 @@ class OrientationPaintTests(unittest.TestCase):
         for hit in ("where am i?", "what stage am i at", "am i set up?",
                     "what should i do next", "where do i start",
                     "what's next", "whats next", "what next", "what is next",
-                    "/discover journey", "discover where",
                     # Fuzzy-tail orientation phrasings (Lever A): still first-person and
-                    # about the user's OWN position/progress, so they earn the rail.
+                    # about the user's OWN position/progress, so they earn the nudge.
                     "catch me up", "remind me where I left off",
                     "remind me what I was doing", "how far along am I",
                     "am I making progress", "am I making any progress",
@@ -2246,12 +2483,18 @@ class OrientationPaintTests(unittest.TestCase):
                     "what have we gotten done so far", "what should I be working on",
                     "how's my project going", "how is my project coming along"):
             self.assertTrue(sfx._is_orientation_question(hit), hit)
-        # Bare Salesforce product nouns must NOT paint the rail: "journey" is
+        # Bare Salesforce product nouns must NOT paint the nudge: "journey" is
         # Marketing Cloud Journey Builder, "stage" is Opportunity Stage. Anchoring
         # to first-person orientation phrasing keeps these ordinary tasks quiet.
         for miss in ("where is the Account class?", "which directory holds the flows",
                      "add the apex skill", "deploy to prod", "", "x" * 3000,
-                     # capability-catalog question -> discovery overview, NOT the rail
+                     # The explicit `discover journey`/`where` COMMAND form is handled on
+                     # the UserPromptExpansion path (it paints the full ranked hints), so
+                     # it must NOT also trigger the ambient submit-path nudge — otherwise
+                     # the command double-paints.
+                     "/discover journey", "discover where", "discover journey",
+                     "/salesforce-development:discover where",
+                     # capability-catalog question -> discovery overview, NOT the nudge
                      "what can I do here",
                      "build a customer journey in Marketing Cloud",
                      "update the Journey Builder flow",
@@ -2274,21 +2517,31 @@ class OrientationPaintTests(unittest.TestCase):
                      "remind me where I was in the code"):
             self.assertFalse(sfx._is_orientation_question(miss), miss)
 
-    def test_orientation_prompt_paints_colored_rail_on_systemmessage(self):
+    def test_orientation_prompt_paints_colored_nudge_line_on_systemmessage(self):
         code, result = self.capture("where am i?")
         self.assertEqual(code, 0)
         sysmsg = result["systemMessage"]
         note = result["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("\x1b[32m", sysmsg)   # current stage greened (the one accent)
-        # leading blank separates the rail from Claude Code's hook-message wrapper.
-        # The paint path colors via the gate, so recompute with it to match exactly.
-        self.assertEqual(sysmsg, "\n" + sfx._render_journey_rail(self.STATE, color=sfx._banner_color_enabled()))
+        # journey-nudges Phase 7: the glyph rail's single green "current stage"
+        # accent is retired along with the glyph geometry — the word-list + Next
+        # line paint via the same theme-adaptive palette every other band uses
+        # (undimmed body text for the free-text Next clause), not a hardcoded green.
+        self.assertIn("\x1b[22m", sysmsg)   # the Next clause is painted, not raw plain
+        # leading blank separates the surface from Claude Code's hook-message
+        # wrapper. The paint path colors via the gate, so recompute with it to
+        # match exactly — a post-hoc re-select is safe here (same fingerprint,
+        # well under the anti-nag session cap), matching the CommandPaintTests
+        # golden-recompute pattern.
+        candidate = sfx._select_inline_nudge(
+            self.STATE, Path.cwd().resolve(), None, session_id="s1")
+        self.assertEqual(sysmsg, "\n" + "\n".join(sfx._render_nudge_inline(
+            self.STATE, candidate, color=sfx._banner_color_enabled())))
         stripped = strip_ansi(sysmsg)
         self.assertIn("sfdx project: acme-crm", stripped)
         self.assertIn("org: acme-dev ✓", stripped)
-        self.assertTrue(all(len(l) <= 80 for l in stripped.splitlines() if l not in sfx._WIDTH_EXEMPT_PLAIN_LINES))
+        self.assertTrue(all(sfx._is_width_exempt(l) or len(l) <= 80 for l in stripped.splitlines()))
         # Model note is ANSI-free, names the stage, and forbids reproduction — it
-        # must NOT hand the model the rail ASCII to parrot.
+        # must NOT hand the model the nudge ASCII to parrot.
         self.assertNotIn("\x1b", note)
         self.assertIn("Build", note)
         self.assertRegex(note, r"(?i)do not reproduce")
@@ -2302,23 +2555,30 @@ class OrientationPaintTests(unittest.TestCase):
                 code, result = self.capture(prompt)
                 self.assertEqual((code, result), (0, {"continue": True}))
 
-    def test_rail_painting_branches_record_the_per_turn_dedup_flag(self):
-        # Every rail branch atomically claims its fallback prompt namespace. Each
+    def test_nudge_painting_branches_record_the_per_turn_dedup_flag(self):
+        # Every nudge branch atomically claims its fallback prompt namespace. Each
         # direct UserPromptSubmit call rotates that old-host token; silent turns do not claim.
-        self.capture("where am i?")                                 # in-project orientation rail
-        self.assertTrue(sfx._rail_painted_this_turn("s1"), "orientation rail branch")
-        self.capture_status("what's the status of the project")     # status bands + rail
-        self.assertTrue(sfx._rail_painted_this_turn("s1"), "status branch")
-        self.capture("add a field to the Account object")           # entered => silent, no rail
-        self.assertFalse(sfx._rail_painted_this_turn("s1"), "silent turn must not set the flag")
+        self.capture("where am i?")                                 # in-project orientation nudge
+        self.assertTrue(sfx._nudge_painted_this_turn("s1"), "orientation nudge branch")
+        self.capture_status("what's the status of the project")     # status bands + nudge
+        self.assertTrue(sfx._nudge_painted_this_turn("s1"), "status branch")
+        self.capture("add a field to the Account object")           # entered => silent, no nudge
+        self.assertFalse(sfx._nudge_painted_this_turn("s1"), "silent turn must not set the flag")
 
-    def test_orientation_paint_records_the_step_signature_for_the_wayfinder(self):
-        # The reprint-on-change gate's other half: an orientation paint records WHAT it
-        # showed, so a same-turn connect (the wayfinder) can tell the rail did not move
-        # and skip a duplicate. Companion to the per-turn flag test above.
-        sfx._session_marker("s1", "railsig").unlink(missing_ok=True)
+    def test_orientation_paint_records_the_signature_for_the_wayfinder(self):
+        # The reprint-on-change gate's other half: an orientation paint records WHAT
+        # candidate it showed (bookkeeping only — this branch is the unmigrated bare
+        # nudge, so nothing was actually shown as a Next line), so a same-turn connect
+        # (the wayfinder) can tell the nudge did not change and skip a duplicate.
+        # Companion to the per-turn flag test above.
+        sfx._session_marker("s1", "nudgesig").unlink(missing_ok=True)
         self.capture("where am i?")
-        self.assertEqual(sfx._last_rail_signature("s1"), sfx._rail_signature(self.STATE))
+        expected_candidate = sfx._select_inline_nudge(
+            self.STATE, Path.cwd().resolve(), None, session_id="s1",
+        )
+        self.assertEqual(
+            sfx._last_nudge_signature("s1"), sfx._nudge_signature(expected_candidate),
+        )
 
     def test_lever_c_dedupes_on_a_regex_hit_and_paints_on_a_regex_miss(self):
         # UserPromptSubmit and PostToolUse compose through the same fallback prompt
@@ -2336,27 +2596,31 @@ class OrientationPaintTests(unittest.TestCase):
 
         # (a) regex HIT: the UserPromptSubmit paint sets the flag; journey-paint dedupes.
         self.capture("where am i?")
-        self.assertTrue(sfx._rail_painted_this_turn("s1"))
-        self.assertEqual(run_journey_paint(), {"continue": True})   # deduped — no second rail
+        self.assertTrue(sfx._nudge_painted_this_turn("s1"))
+        self.assertEqual(run_journey_paint(), {"continue": True})   # deduped — no second nudge
 
         # (b) regex MISS (the Lever-C win): a phrase _is_orientation_question rejects leaves
         # the flag unset (the UserPromptSubmit hook stays silent), so journey-paint paints.
         self.assertFalse(sfx._is_orientation_question("what's the state of things"))
         _, ups = self.capture("what's the state of things")
         self.assertEqual(ups, {"continue": True})
-        self.assertFalse(sfx._rail_painted_this_turn("s1"))
+        self.assertFalse(sfx._nudge_painted_this_turn("s1"))
         self.assertIn("systemMessage", run_journey_paint())
 
-    def test_explicit_discovery_command_forms_all_paint(self):
+    def test_explicit_discovery_command_forms_stay_silent_on_submit_path(self):
+        # A typed `/discover journey`/`where` paints its full ranked hints list on the
+        # UserPromptExpansion path (cmd_command_paint, covered by CommandPaintTests).
+        # The ambient UserPromptSubmit path must therefore stay SILENT for the command
+        # form — otherwise it double-paints a single nudge on top of the command's hints.
         for prompt in ("/discover journey", "/salesforce-development:discover where",
                        "discover journey"):
             with self.subTest(prompt=prompt):
-                _, result = self.capture(prompt)
-                self.assertIn("systemMessage", result)
+                code, result = self.capture(prompt)
+                self.assertEqual((code, result), (0, {"continue": True}))
 
     def test_journey_product_term_does_not_paint_end_to_end(self):
         # Regression for the confirmed over-fire: a Journey Builder / customer-journey
-        # task prompt must be a silent continue, not an unasked-for painted rail.
+        # task prompt must be a silent continue, not an unasked-for painted nudge.
         for prompt in ("build a customer journey in Marketing Cloud",
                        "where is the journey builder flow?"):
             with self.subTest(prompt=prompt):
@@ -2394,7 +2658,7 @@ class OrientationPaintTests(unittest.TestCase):
                 mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(out):
             sfx.cmd_orientation_paint()
         stripped = strip_ansi(json.loads(out.getvalue())["systemMessage"])
-        self.assertEqual([l for l in stripped.splitlines() if len(l) > 80 and l not in sfx._WIDTH_EXEMPT_PLAIN_LINES], [])
+        self.assertEqual([l for l in stripped.splitlines() if len(l) > 80 and not sfx._is_width_exempt(l)], [])
 
     def test_orientation_paint_note_is_compact_facts_not_a_rendering_handbook(self):
         _, result = self.capture("where am i?")
@@ -2427,7 +2691,7 @@ class OrientationPaintTests(unittest.TestCase):
         # A recorded FAILED deploy in this project makes a cursor-Deploy micro block
         # read `attempted` with the failure event on record — the honest "not
         # deployed" signal — while the block invents no error text or count (none is
-        # persisted). The macro rail on systemMessage is unaffected.
+        # persisted). The macro nudge on systemMessage is unaffected.
         Path(".sf").mkdir(exist_ok=True)
         Path(".sf/phase-history.jsonl").write_text(
             json.dumps({"type": "deploy", "stage": "Deploy", "outcome": "failed",
@@ -2502,7 +2766,9 @@ class MicroTierTests(unittest.TestCase):
         self.assertEqual(len(facts["events"]), 1)                    # cursor stage only
         self.assertEqual(set(facts["events"][0]), {"type", "outcome", "source"})
         self.assertEqual(facts["events"][0]["outcome"], "failed")
-        self.assertEqual(facts["likely_next"], sfx.NEXT_ACTION["Deploy"].strip())
+        # journey-nudges Phase 5: no candidate was passed, so this degrades to the
+        # neutral "nothing selected" text rather than a retired per-stage lookup.
+        self.assertEqual(facts["likely_next"], "no outstanding next step")
 
     def test_events_are_capped(self):
         history = [{"stage": "Observe", "outcome": "present", "type": "observe-skill", "source": "s"}
@@ -2559,9 +2825,10 @@ class MicroTierTests(unittest.TestCase):
 
 class GettingStartedWelcomeTests(unittest.TestCase):
     """Side A of the paint hook: OUTSIDE a Salesforce project, a prompt that names
-    Salesforce or CRM (the product category) surfaces the unstyled getting-started
-    welcome, once per session. The plugin is global, so orientation phrasing alone must
-    NOT paint in a random dir — only an explicit Salesforce/CRM product cue does."""
+    Salesforce or CRM (the product category) emits a MODEL-FACING-ONLY note (no
+    visible paint — entered-project-splash plan, Change 2), once per session. The
+    plugin is global, so orientation phrasing alone must NOT trip this in a random
+    dir — only an explicit Salesforce/CRM product cue does."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2607,224 +2874,84 @@ class GettingStartedWelcomeTests(unittest.TestCase):
             code = sfx.cmd_orientation_paint()
         return code, json.loads(out.getvalue())
 
-    def test_salesforce_mention_paints_the_readiness_agnostic_welcome(self):
-        # D6 + presentation parity (owner direction 2026-08-05): a Salesforce mention
-        # outside a project surfaces the welcome SURFACE, which now paints the SAME chrome
-        # as the SessionStart banner — the colored HEADLESS lockup, the install summary,
-        # the org + project bands, the position rail, and the shared wayfinding footer —
-        # plus, below the rail, ONLY the connect + create next steps (no overview CTA, no
-        # awareness heads-up), with NO environment check behind it. Pin
-        # _configured_target_alias to None (a true
-        # newcomer with no target org) so the rail state is deterministic (capture()
-        # clears the env, so the target-org read would otherwise hit the real ~/.sf and
-        # float the cursor between Connect and Project; a cleared PATH also means the
-        # welcome's org probe no-ops, so the org band shows the empty "none connected").
+    def test_no_out_of_project_surface_flips_the_welcome_flag(self):
+        # Invariant (owner directive): NOTHING in the out-of-project experience may
+        # record the `welcome` splash flag — only a successful `sf project generate`
+        # (cmd_scaffold_paint) flips it. If any Side-A prompt surface burned `welcome`
+        # it would pre-suppress the scaffold splash, the one visible surface meant to
+        # greet a freshly created project. Every Side-A handler records its OWN trip
+        # marker (modelnote / create_flow_shown / nudge_shown) instead — never welcome.
+        sid = "s1"
+        with mock.patch.object(sfx, "_configured_target_alias", return_value=None):
+            # A bare Salesforce mention trips the session (records modelnote) but must
+            # NOT record welcome — it is model-facing-only, nothing was painted.
+            self.capture("let's build something on salesforce", session_id=sid)
+            self.assertTrue(sfx._model_noted_this_session(sid))    # tripped
+            self.assertFalse(sfx._welcomed_this_session(sid))      # but never welcomed
+            # With the session tripped, every other Side-A intent must also leave
+            # welcome unset (create-flow, orientation, overview, connect, environment).
+            for prompt in (
+                "create a new salesforce project",
+                "where am I",
+                "what can I do here?",
+                "connect an org",
+                "set up my environment",
+            ):
+                self.capture(prompt, session_id=sid)
+                self.assertFalse(
+                    sfx._welcomed_this_session(sid),
+                    f"out-of-project prompt {prompt!r} must not flip the welcome flag",
+                )
+
+    def test_salesforce_mention_emits_model_facing_note_only(self):
+        # Change 2 (entered-project-splash plan): a Salesforce mention outside a
+        # project no longer paints ANY visible chrome — no banner, no rail, no org/
+        # project bands. It emits a MODEL-FACING-ONLY note steering the model to offer
+        # the discover-overview command or project creation, and explicitly telling it
+        # not to paint a banner or welcome surface itself. Pin _configured_target_alias
+        # to None (a true newcomer) — irrelevant to the (now org-agnostic) note, but
+        # keeps this test independent of the real ~/.sf state.
         with mock.patch.object(sfx, "_configured_target_alias", return_value=None):
             _, result = self.capture("I want to build something on Salesforce")
-        sysmsg = result["systemMessage"]
-        visible = strip_ansi(sysmsg)
-        # The banner chrome the welcome now shares (the presentation-layer elements).
-        self.assertIn(sfx.BANNER, visible)                      # the colored HEADLESS lockup
-        self.assertIn("plugin(s) installed", visible)           # the consolidated slot-2 summary
-        self.assertIn("Salesforce plugin(s) available to add", visible)
-        self.assertNotIn("skills installed", visible)           # retired inventory chrome is gone
-        self.assertIn("org: ", visible)                         # the org band (empty here)
-        self.assertIn("sfdx project: (none detected)", visible)  # the one-line project band
-        self.assertNotIn("You don't memorize commands here.", visible)   # mindset line gone
-        self.assertIn("✳ New here?", visible)                   # the shared wayfinding footer
-        # Below-rail is pared to the two build-blocking next steps only (owner
-        # direction 2026-09-01): no org yet → connect + create, and nothing else. The
-        # "what can I do here?" prompt now rides ONLY the ✳ pointer, not a standalone CTA.
-        self.assertIn('"connect an org"', sysmsg)               # connect step (no org yet)
-        self.assertIn("create a Salesforce project", sysmsg)    # create step
-        self.assertNotIn("see what you can build here", visible)  # old overview CTA gone
-        self.assertNotIn("environment set up", visible)         # env heads-up gone
-        self.assertNotIn("Or just describe", visible)           # describe line gone
-        # A newcomer's rail is all ○ with no accent (nothing reached yet); the green
-        # in the message is the "✓ plugin(s) installed" summary, not the rail.
-        self.assertIn("\x1b[32m", sysmsg)
-        self.assertNotIn("you are here", sysmsg)                # marker stays gone
-        self.assertNotIn("set up my environment", sysmsg)       # the OLD readiness lead is gone
+        self.assertNotIn("systemMessage", result)                # no visible paint at all
         note = result["hookSpecificOutput"]["additionalContext"]
-        self.assertRegex(note, r"(?i)do not reproduce")
-        # A pinned surface: every painted line holds inside 80 columns.
-        self.assertEqual([l for l in visible.splitlines() if len(l) > 80 and l not in sfx._WIDTH_EXEMPT_PLAIN_LINES], [])
-
-    def test_getting_started_welcome_paints_the_all_circle_teaching_map(self):
-        # Out of a project with no org, the welcome paints the rail as a TEACHING MAP —
-        # the whole path with nothing earned yet: all six stages ○, no ● and no ◉ accent
-        # anywhere (nothing is reached, so there is no frontier to mark). Seeing it born
-        # empty and light up teaches the shape better than having it appear mid-journey.
-        with mock.patch.object(sfx, "_configured_target_alias", return_value=None):
-            _, result = self.capture("I want to build on Salesforce")
-        visible = strip_ansi(result["systemMessage"])
-        # The signpost row carries the journey glyphs; the org + project band rules are
-        # long dash runs too now, so match the glyph row by its glyphs, not by dashes.
-        glyph_row = next(l for l in visible.splitlines() if any(g in l for g in ("◉", "●", "○")))
-        self.assertNotIn("●", glyph_row)                 # nothing reached yet — a map, not progress
-        self.assertNotIn("◉", glyph_row)                 # no frontier either — nothing is reached to mark
-        self.assertEqual(glyph_row.count("○"), 6)        # the whole path ahead, all empty
-        self.assertIn("connect", visible)                # first stage
-        self.assertIn("observe", visible)                # …through the last
+        self.assertRegex(note, r"(?i)do not (?:reproduce|paint)")
+        self.assertRegex(note, r"(?i)discover overview")
+        self.assertRegex(note, r"(?i)create a new salesforce dx project")
+        # The getting-started entry is the more common "build something" front door and
+        # ALSO leads to a scaffold — so it must carry the same template-choice guardrail
+        # as the create-flow note: route the scaffold through dx-project-create, never
+        # assume a template, and don't collapse a UI ask to LWC (Image #5 regression).
+        self.assertIn("dx-project-create", note)
+        self.assertRegex(note, r"(?i)template is the user's explicit choice|never assume")
+        self.assertRegex(note, r"(?i)react")
+        self.assertRegex(note, r"(?i)collapse .*(?:to )?LWC|LWC.*default")
 
     def test_welcome_never_consults_readiness_or_runs_a_scan(self):
-        # The hard D6 guarantee: painting the welcome must never invoke the ~9s
-        # check-tools scan (I4) and — since readiness left the front stages — must not
-        # even read the readiness signal. The model note steers the model away from
-        # running a check or pushing project creation as a prerequisite.
+        # The hard D6 guarantee still holds post-demotion: the model-facing-only note
+        # must never invoke the ~9s check-tools scan (I4) and must not read the
+        # readiness signal — it hands off to the model instead of probing anything.
         with mock.patch.object(sfx, "_configured_target_alias", return_value=None), \
                 mock.patch.object(sfx, "cmd_check_tools") as scan, \
                 mock.patch.object(sfx, "_welcome_readiness") as readiness:
             _, result = self.capture("help me build something on Salesforce")
         scan.assert_not_called()          # the ~9s scan never runs on the greeting (I4)
-        readiness.assert_not_called()     # D6: the welcome no longer reads readiness at all
-        sysmsg = result["systemMessage"]
-        self.assertIn(sfx.BANNER, strip_ansi(sysmsg))           # colored lockup → match stripped
-        self.assertIn("create a Salesforce project", sysmsg)    # still offers create, ungated
+        readiness.assert_not_called()     # the note never reads readiness at all
+        self.assertNotIn("systemMessage", result)                # model-facing only, no paint
         note = result["hookSpecificOutput"]["additionalContext"]
-        self.assertRegex(note, r"(?i)do not run an environment")
-        self.assertNotIn("platform-environment-validate", note)  # no check nag anymore
-
-    def test_returning_dev_welcome_reflects_the_org_and_pivots_to_project(self):
-        # D6 refinement: a configured target org (a returning developer — Connect is the
-        # only reached stage, so it is the greened ◉ frontier; Project is the unmarked
-        # cursor) is legitimate. The welcome must SHOW they are connected and pivot to a
-        # project + discovery, NOT re-offer "connect an org" or name the environment tax
-        # (they have the CLI — that is how an org got targeted).
-        with mock.patch.object(sfx, "_configured_target_alias", return_value="acme-dev"):
-            _, result = self.capture("lets build something on salesforce")
-        visible = strip_ansi(result["systemMessage"])
-        # capture() clears PATH, so the welcome's org probe no-ops and the org band shows
-        # the subprocess-free `org: <alias>` line (the full block is covered by
-        # test_returning_dev_welcome_shows_full_org_block_when_probed).
-        self.assertIn("org: acme-dev", visible)                 # the org is shown…
-        self.assertNotIn("org: unknown", visible)               # …not a bare "unknown"
-        # Below-rail is pared to just the create-a-project step (owner direction
-        # 2026-09-01): org already set → no connect line, and no lead-in prose,
-        # overview CTA, "describe what you want", or env heads-up.
-        self.assertIn("create a Salesforce project", visible)   # the one remaining step
-        self.assertNotIn("already have a target org", visible)  # lead-in prose gone
-        self.assertNotIn("see what you can build here", visible)  # overview CTA gone
-        self.assertNotIn("Or just describe", visible)           # describe line gone
-        self.assertNotIn('"connect an org"', visible)           # no connect CTA for a returning dev
-        self.assertNotIn("environment set up", visible)         # and no env heads-up
-        # Match the glyph row by its glyphs (the band rules are long dash runs too now).
-        glyph_row = next(l for l in visible.splitlines() if any(g in l for g in ("◉", "●", "○")))
-        self.assertNotIn("●", glyph_row)                        # Connect is the frontier ◉, not a plain ●
-        self.assertEqual(glyph_row.count("◉"), 1)               # Connect earned — the lone reached, the frontier
-        self.assertEqual(glyph_row.count("○"), 5)               # Project + the four stages after it
-        self.assertEqual([l for l in visible.splitlines() if len(l) > 80 and l not in sfx._WIDTH_EXEMPT_PLAIN_LINES], [])  # still ≤80
-        note = result["hookSpecificOutput"]["additionalContext"]
-        self.assertRegex(note, r"(?i)already have a target org")  # steer to project, not connect
-        self.assertNotIn("platform-environment-validate", note)  # no check nag
-
-    def test_returning_dev_welcome_shows_full_org_block_when_probed(self):
-        # Presentation parity (owner direction 2026-08-05): when a target org is
-        # configured, the welcome resolves it (via _resolve_welcome_org) and paints the
-        # SAME full org band as the SessionStart banner — edition · API · username ·
-        # instance · MCP — not just the bare alias. The probe is gated (configured only),
-        # once-per-session, and fails soft to the alias line; mock it here to exercise the
-        # full-block path deterministically without an `sf` subprocess.
-        org = {"alias": "acme-dev", "edition": "Developer Edition (Sandbox)",
-               "apiVersion": "67.0", "username": "dev@acme.example.com",
-               "instanceUrl": "https://acme.my.salesforce.com"}
-        with mock.patch.object(sfx, "_configured_target_alias", return_value="acme-dev"), \
-                mock.patch.object(sfx, "_resolve_welcome_org", return_value=org):
-            _, result = self.capture("lets build something on salesforce")
-        visible = strip_ansi(result["systemMessage"])
-        self.assertIn("org: acme-dev ✓ · Developer Edition (Sandbox) · API 67.0", visible)
-        self.assertIn("dev@acme.example.com", visible)          # the username · instance detail line
-        self.assertIn("MCP:", visible)                          # the MCP line, like the banner
-        self.assertIn("sfdx project: (none detected)", visible)  # still no project
-        self.assertIn("✳ New here?", visible)                    # …and the shared footer
-        self.assertNotIn("You don't memorize commands here.", visible)  # mindset line gone
-        self.assertEqual([l for l in visible.splitlines() if len(l) > 80 and l not in sfx._WIDTH_EXEMPT_PLAIN_LINES], [])  # ≤80 holds
+        self.assertRegex(note, r"(?i)do not (?:reproduce|paint)")
 
     def test_welcome_paints_only_once_per_session(self):
         self.capture("I want to build on Salesforce", session_id="s1")
         _, again = self.capture("help me build a Salesforce app", session_id="s1")
         self.assertEqual(again, {"continue": True})
 
-    def test_welcome_bridge_folds_a_high_anchor_rec_into_the_welcome(self):
-        # Option B (welcome bridge): naming Salesforce OUTSIDE a project is the
-        # sufficient-intent signal that stands in for the project file (the parallel
-        # to explicit discovery — docs/design/plugin-catalog.md). So a CMS task that
-        # names Salesforce surfaces the SAME high+anchor catalog rec the in-project
-        # UserPromptSubmit path would, folded INTO the welcome — visible rec on the
-        # systemMessage channel AND a model note, plus an open decision workflow so a
-        # later sole-candidate acceptance can install it. Pin the org to None (a true
-        # newcomer) so only the bridge, not the org variant, drives the assertions.
-        with mock.patch.object(sfx, "_configured_target_alias", return_value=None):
-            _, result = self.capture(
-                "I need to search Salesforce CMS for an existing media asset")
-        sysmsg = result["systemMessage"]
-        visible = strip_ansi(sysmsg)
-        self.assertIn(sfx.BANNER, visible)                       # the welcome still paints…
-        self.assertIn("Recommended plugin", sysmsg)  # …with the rec folded in
-        self.assertIn("experience-cms", sysmsg)                  # named in the visible bullet
-        # The compact one-line bullet holds the welcome's pinned 80-column frame.
-        self.assertEqual([l for l in visible.splitlines() if len(l) > 80 and l not in sfx._WIDTH_EXEMPT_PLAIN_LINES], [])
-        note = result["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("high-confidence plugin match", note)      # the model-facing rec note
-        self.assertIn("experience-cms", note)
-        self.assertIn("plugin-install experience-cms", note)     # install pointer rides the note now
-        # The workflow is open with the rec as the SOLE candidate, so a later bare
-        # "yes" resolves to it (the sole-candidate accept path) — no auto-pick.
-        flow = sfx._load_plugin_flow("s1")
-        self.assertEqual(flow.get("candidates"), ["experience-cms"])
-        self.assertEqual(flow.get("state"), "recommended")
-
-    def test_welcome_bridge_sole_candidate_yes_routes_the_named_install(self):
-        # The "fix that" half, end to end through the bridge: once the welcome bridge
-        # has opened a sole-candidate workflow, a bare "yes" in the same session
-        # resolves that one candidate and hands the model the named accept-proposed
-        # install route — never a guess, never a silent turn.
-        with mock.patch.object(sfx, "_configured_target_alias", return_value=None):
-            self.capture(
-                "I need to search Salesforce CMS for an existing media asset",
-                session_id="s1")
-        _, accepted = self.capture("yes", session_id="s1")
-        note = accepted["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("plugin-install experience-cms --accept-proposed", note)
-        self.assertIn("experience-cms", note)
-
-    def test_welcome_bridge_stays_quiet_without_a_strong_anchored_match(self):
-        # The high+anchor bar still governs the bridge: naming Salesforce is enough to
-        # PAINT the welcome, but a bare mention with no strong capability match folds
-        # in NO rec and opens NO workflow — the bridge is not a fifth, lower-bar
-        # surface, it reuses the proactive bar exactly.
-        with mock.patch.object(sfx, "_configured_target_alias", return_value=None):
-            _, result = self.capture("I want to build something on Salesforce")
-        self.assertIn(sfx.BANNER, strip_ansi(result["systemMessage"]))  # welcome fires…
-        self.assertNotIn("Recommended plugin", result["systemMessage"])  # …no rec
-        self.assertIsNone(sfx._load_plugin_flow("s1"))                   # …and no open workflow
-
-    def test_welcome_installed_test_drive_folds_no_pointer(self):
-        # Recommendations are uninstalled-only (owner direction 2026-08-31): when
-        # salesforce-test-drive IS installed, the getting-started welcome folds in
-        # NOTHING for it — no "you already have it" pointer, no run pointer, and no
-        # install command. The user already has it and just runs its command; the
-        # welcome only ever surfaces plugins they do NOT have. The banner itself
-        # still paints on its own.
-        with mock.patch.object(sfx, "_configured_target_alias", return_value=None), \
-                mock.patch.object(
-                    sfx, "_enabled_plugin_names",
-                    return_value={"salesforce-development",
-                                  sfx._TEST_DRIVE_PLUGIN_NAME}):
-            _, result = self.capture("how do I get started with Salesforce")
-        sysmsg = result["systemMessage"]
-        visible = strip_ansi(sysmsg)
-        self.assertIn(sfx.BANNER, visible)                       # the welcome still paints…
-        self.assertNotIn("You already have this plugin installed", sysmsg)  # …no pointer
-        self.assertNotIn(f"run {sfx._TEST_DRIVE_ENTRY_COMMAND}", sysmsg)    # no run pointer
-        self.assertNotIn("plugin-install", sysmsg)               # and no install command
-
     def test_out_of_project_connect_intent_when_tripped_hands_off_the_flow(self):
         # Side A (D9/D10): once the session is tripped (welcomed), a connect-org intent
         # outside a project hands the model the cheap-check + ternary note — model-facing
         # only, no paint. This is the core newcomer path (they said "build on Salesforce"
         # first). capture() clears the env, so `sf` is absent → the setup route.
-        sfx._record_welcomed("s1")
+        sfx._record_model_noted("s1")
         _, result = self.capture("connect an org")
         self.assertNotIn("systemMessage", result)                # model-facing only, no paint
         note = result["hookSpecificOutput"]["additionalContext"]
@@ -2845,7 +2972,7 @@ class GettingStartedWelcomeTests(unittest.TestCase):
         # the create-flow note (model-facing ONLY, no visible paint): env-verify → pick a
         # direction → scaffold, plus ONE light nudge that the catalog is browsable. A second
         # create-intent does NOT re-fire (once per session = signal, not noise).
-        sfx._record_welcomed("s1")
+        sfx._record_model_noted("s1")
         with mock.patch.object(sfx, "_render_overview_paint") as rp:
             _, first = self.capture("create a Salesforce project")
             _, second = self.capture("let's scaffold a new project")
@@ -2856,11 +2983,24 @@ class GettingStartedWelcomeTests(unittest.TestCase):
         self.assertRegex(note, r"(?i)direction")                  # pick a direction to build
         self.assertRegex(note, r"(?i)scaffold")                   # the outcome is a scaffolded project
         self.assertIn("what can I do here?", note)                # the one light catalog nudge
+        # Template must be an EXPLICIT choice, not inferred from the high-level direction:
+        # the note routes the scaffold through dx-project-create (which owns the template
+        # picker) and forbids silently defaulting to standard. Regression for the reported
+        # miss: picking "A UI (LWC / pages)" got mapped to `standard` with no template ask.
+        self.assertIn("dx-project-create", note)                  # scaffold via the skill that asks
+        self.assertRegex(note, r"(?i)template")                   # the template decision is called out
+        self.assertRegex(note, r"(?i)never default to standard")  # no silent standard fallback
+        # A UI direction must NOT collapse to LWC — the note names React/Angular as
+        # first-class UI options so the model doesn't narrow "a UI" to Lightning.
+        # Regression for the reported miss: picking "UI (LWC / Lightning pages)" jumped
+        # straight to LWC + a standard project with no framework choice.
+        self.assertRegex(note, r"(?i)react")                      # React/Angular are UI options too
+        self.assertRegex(note, r"(?i)not\b.*\bLWC|LWC\b.*default") # don't assume LWC by default
         self.assertTrue(sfx._create_flow_shown_this_session("s1"))
         self.assertEqual(second, {"continue": True})              # once only — no re-fire
 
     def test_create_flow_hot_path_checks_marker_before_lock(self):
-        sfx._record_welcomed("s1")
+        sfx._record_model_noted("s1")
         sfx._record_create_flow_shown("s1")
         with mock.patch.object(sfx, "_acquire_create_flow_lock", return_value=None) as acquire:
             _, result = self.capture("create a Salesforce project")
@@ -2876,7 +3016,7 @@ class GettingStartedWelcomeTests(unittest.TestCase):
             "import pathlib,runpy,sys,time; "
             "ns=runpy.run_path(sys.argv[1]); g=ns['cmd_orientation_paint'].__globals__; "
             "g['_WELCOME_MARKER_DIR']=pathlib.Path(sys.argv[2]); "
-            "g['_record_welcomed']('s1'); original=g['emit']; "
+            "g['_record_model_noted']('s1'); original=g['emit']; "
             "pathlib.Path(sys.argv[3]).write_text('ready'); gate=pathlib.Path(sys.argv[4]); "
             "deadline=time.monotonic()+5; "
             "exec('while not gate.exists() and time.monotonic() < deadline:\\n time.sleep(.01)'); "
@@ -2916,7 +3056,7 @@ class GettingStartedWelcomeTests(unittest.TestCase):
         )
 
     def test_create_flow_retries_after_emit_failure(self):
-        sfx._record_welcomed("s1")
+        sfx._record_model_noted("s1")
         with mock.patch.object(sfx, "emit", side_effect=RuntimeError("emit failed")):
             _, failed = self.capture("create a Salesforce project")
         self.assertEqual(failed, {"continue": True})
@@ -2936,7 +3076,7 @@ class GettingStartedWelcomeTests(unittest.TestCase):
         # Precision: "create a custom object" is Build-stage work inside a project, not
         # a project-CREATION intent, so it must NOT fire the create-flow note even when
         # tripped (and it has no Salesforce mention, so it stays silent).
-        sfx._record_welcomed("s1")
+        sfx._record_model_noted("s1")
         _, result = self.capture("create a custom object")
         self.assertEqual(result, {"continue": True})
         self.assertFalse(sfx._create_flow_shown_this_session("s1"))
@@ -2951,6 +3091,15 @@ class GettingStartedWelcomeTests(unittest.TestCase):
             self.assertTrue(sfx._is_create_project_intent(prompt), prompt)
         for prompt in ("set up my environment", "set up the deploy pipeline for this service"):
             self.assertFalse(sfx._is_create_project_intent(prompt), prompt)
+
+    def test_create_intent_recognizes_both_scaffold_command_forms(self):
+        # The typed scaffold command trips create-intent whether it's the deprecated
+        # `sf project generate` or the non-deprecated `sf template generate project`.
+        for prompt in ("sf project generate -n acme", "sfdx project create -n acme",
+                       "sf template generate project -t standard -n acme"):
+            self.assertTrue(sfx._is_create_project_intent(prompt), prompt)
+        # A different `template generate` subcommand is not project scaffolding.
+        self.assertFalse(sfx._is_create_project_intent("sf template generate apex-class -n Foo"))
 
     def test_environment_intent_matrix(self):
         # The environment check is a stage-independent capability (D5) with its own direct
@@ -2967,7 +3116,7 @@ class GettingStartedWelcomeTests(unittest.TestCase):
         # Tripped (welcomed) Side A: "set up my environment" hands the model a note steering
         # to the on-demand readiness check — the ~9s scan never runs in the hook (I4), and
         # nothing is painted (model-facing only).
-        sfx._record_welcomed("s1")
+        sfx._record_model_noted("s1")
         with mock.patch.object(sfx, "cmd_check_tools") as scan:
             _, result = self.capture("set up my environment")
         scan.assert_not_called()                        # I4: never scans in the hook
@@ -3001,18 +3150,18 @@ class GettingStartedWelcomeTests(unittest.TestCase):
                 _, result = self.capture(prompt)
                 self.assertEqual(result, {"continue": True})
 
-    def test_tripped_out_of_project_orientation_ask_paints_the_rail(self):
+    def test_tripped_out_of_project_orientation_ask_paints_the_nudge(self):
         # The other half of the Side A guard: once the plugin has been tripped this
         # session (welcomed), an orientation question DOES paint the Tier-1 position
-        # rail — the same discipline as the overview ask. The rail rides the visible
+        # nudge — the same discipline as the overview ask. The nudge rides the visible
         # channel, and the model gets the do-not-reproduce note so it never re-runs
-        # `discover journey` or reprints the rail. Without this branch the model
-        # serviced "where am I" itself and double-printed a colorless rail (the bug).
-        sfx._record_welcomed("s1")
+        # `discover journey` or reprints the nudge. Without this branch the model
+        # serviced "where am I" itself and double-printed a colorless nudge (the bug).
+        sfx._record_model_noted("s1")
         # The natural out-of-project orientation state after the redesign: an all-○
         # teaching map ("here's the whole path; you're at the start"), nothing earned
         # yet. The state still carries currentStage=Connect for the model, but with no
-        # reached stage the visible rail has no accent — it is entirely plain ○.
+        # reached stage the visible nudge has no accent — it is entirely plain ○.
         state = {
             "stages": [{"name": n, "status": s} for n, s in [
                 ("Connect", "current"), ("Project", "future"), ("Build", "future"),
@@ -3028,10 +3177,19 @@ class GettingStartedWelcomeTests(unittest.TestCase):
             code = sfx.cmd_orientation_paint()
         result = json.loads(out.getvalue())
         self.assertEqual(code, 0)
+        # journey-nudges Phase 7: the glyph rail is retired — this surface now
+        # paints the word-list + single ladder-winning nudge. Recompute the same
+        # candidate the code path resolves (session_id="s1", root=cwd) to build
+        # the golden; a post-hoc re-select is safe (same fingerprint, well under
+        # the anti-nag session cap).
+        candidate = sfx._select_inline_nudge(
+            state, Path.cwd().resolve(), None, session_id="s1")
         self.assertEqual(result["systemMessage"],
-                         "\n" + sfx._render_journey_rail(state, color=sfx._banner_color_enabled()))
-        # No accent on a no-evidence rail: nothing is reached, so there is no frontier to
-        # mark — the whole rail is plain ○, no ◉ and no green (the cursor is not painted).
+                         "\n" + "\n".join(sfx._render_nudge_inline(
+                             state, candidate, color=sfx._banner_color_enabled())))
+        # Nothing is reached in this no-evidence state, so there is no word-list
+        # line and no green accent — the glyph rail's cursor-accent concept never
+        # carries over to the nudge renderer either way.
         self.assertNotIn("\x1b[32m", result["systemMessage"])
         self.assertNotIn("create a Salesforce project", result["systemMessage"])  # NOT the welcome
         note = result["hookSpecificOutput"]["additionalContext"]
@@ -3043,17 +3201,18 @@ class GettingStartedWelcomeTests(unittest.TestCase):
         _, result = self.capture("where is the salesforce config file?")
         self.assertEqual(result, {"continue": True})
 
-    def test_crm_mention_paints_the_welcome_outside(self):
+    def test_crm_mention_emits_model_facing_note_only(self):
         # The Side-A cue is the product CATEGORY, not just the vendor: a newcomer not yet
         # sold on Salesforce ("I want to build a CRM") names the category, and CRM is
-        # Salesforce's space, so out of a project a CRM mention surfaces the same welcome a
-        # "Salesforce" mention does. Lean assertion — the salesforce test above pins the
-        # full chrome; here we only prove the cue reaches the welcome (banner + a peer CTA).
+        # Salesforce's space, so out of a project a CRM mention reaches the same
+        # model-facing-only note a "Salesforce" mention does. Lean assertion — the
+        # salesforce test above pins the note's full content; here we only prove the
+        # cue reaches it (no paint, note present).
         with mock.patch.object(sfx, "_configured_target_alias", return_value=None):
             _, result = self.capture("I want to build a CRM")
-        visible = strip_ansi(result["systemMessage"])
-        self.assertIn(sfx.BANNER, visible)
-        self.assertIn("create a Salesforce project", result["systemMessage"])
+        self.assertNotIn("systemMessage", result)
+        note = result["hookSpecificOutput"]["additionalContext"]
+        self.assertRegex(note, r"(?i)do not (?:reproduce|paint)")
 
     def test_getting_started_intent_cue_set_is_salesforce_or_crm(self):
         # The trigger predicate directly: the minimal cue set is {salesforce, crm} (plural
@@ -3077,7 +3236,7 @@ class GettingStartedWelcomeTests(unittest.TestCase):
         # has, so the block paints directly on the visible channel and the model gets
         # the do-not-reproduce note. It is disjoint from the getting-started intent, so
         # the welcome is NOT re-drawn (its "create a Salesforce project" CTA is absent).
-        sfx._record_welcomed("s1")
+        sfx._record_model_noted("s1")
         block = "Salesforce Headless 360 · what you can do here\n(fixed test block)"
         with mock.patch.object(sfx, "_render_overview_paint", return_value=block) as rp:
             _, result = self.capture("what can I do here?")
@@ -3103,27 +3262,32 @@ class GettingStartedWelcomeTests(unittest.TestCase):
         # Fail-open on the tripped Side-A path: the trip gate opens and the helper is
         # called, but a render failure (None) must fall through to a silent continue,
         # not a paint — the model then falls back to the overview command's stdout.
-        sfx._record_welcomed("s1")
+        sfx._record_model_noted("s1")
         with mock.patch.object(sfx, "_render_overview_paint", return_value=None) as rp:
             _, result = self.capture("what are my options")
         rp.assert_called_once()
         self.assertEqual(result, {"continue": True})
 
-    def test_untripped_salesforce_naming_overview_ask_still_gets_the_welcome(self):
+    def test_untripped_salesforce_naming_overview_ask_still_gets_the_note(self):
         # Regression guard (the intents OVERLAP): an overview ask that ALSO names
         # Salesforce — "what can I do here with Salesforce?" — matches BOTH the
         # overview and the getting-started intent. Untripped, that naming IS the trip,
-        # so the prompt must reach the WELCOME, not be swallowed silently by the
-        # trip-gated overview branch, and the overview block must NOT be built. (The
-        # overview paints only on a LATER ask, once this welcome marks the session
-        # welcomed.)
+        # so the prompt must reach the model-facing-only NOTE, not be swallowed
+        # silently by the trip-gated overview branch, and the overview block must NOT
+        # be built. (The overview paints only on a LATER ask, once this note marks the
+        # session welcomed.)
         with mock.patch.object(sfx, "_render_overview_paint") as rp, \
                 mock.patch.object(sfx, "_welcome_readiness", return_value="ready"):
             _, result = self.capture("what can I do here with Salesforce?")
-        self.assertIn(sfx.BANNER, strip_ansi(result["systemMessage"]))  # the welcome, not silence
-        self.assertIn("create a Salesforce project", result["systemMessage"])
+        self.assertNotIn("systemMessage", result)                   # the note, not silence — no paint
+        note = result["hookSpecificOutput"]["additionalContext"]
+        self.assertRegex(note, r"(?i)do not (?:reproduce|paint)")
         rp.assert_not_called()                                      # overview never built
-        self.assertTrue(sfx._welcomed_this_session("s1"))           # the trip is recorded
+        self.assertTrue(sfx._model_noted_this_session("s1"))           # the trip is recorded
+        # ...on the model-note marker ONLY. It must NOT set the visible-paint
+        # `welcome` marker, or a benign mention would silently suppress the later
+        # scaffold paint (the reported live miss). The two markers are disjoint.
+        self.assertFalse(sfx._welcomed_this_session("s1"))
 
 
 class DeployHookSelfGateTests(unittest.TestCase):
@@ -3252,6 +3416,51 @@ class DeployHookSelfGateTests(unittest.TestCase):
                     self._run_payload(sfx.cmd_post_observe, payload)
                 self.assertEqual([call.args[0] for call in rec.call_args_list], ["Observe"])
 
+    def test_post_test_failure_self_gates_on_command(self):
+        # journey-nudges Phase 6 (T7/O3): defense-in-depth, mirrors cmd_post_deploy_failure
+        # — an unrelated command must never mint a Test/failed record even though the
+        # hook is registered as its own if:-gated PostToolUseFailure entry.
+        with mock.patch.object(sfx, "_record_attributed_phase_event") as rec:
+            code, result = self.run_hook(sfx.cmd_post_test_failure, "cd /tmp && grep foo .")
+        self.assertEqual((code, result), (0, {"continue": True}))
+        rec.assert_not_called()
+        with mock.patch.object(sfx, "_record_attributed_phase_event") as rec, \
+                mock.patch.object(sfx, "_resolve_phase_org_id", return_value=None):
+            code, result = self.run_hook(sfx.cmd_post_test_failure, "sf apex run test --synchronous -o x")
+        self.assertEqual((code, result), (0, {"continue": True}))
+        rec.assert_called_once_with(
+            "Test", "failed", source="cmd_post_test_failure", org_id=None, event_type="test-run")
+
+    def test_post_test_failure_ignores_a_non_synchronous_run(self):
+        # Only the FINAL synchronous form's exit code reliably reflects the test
+        # result — the async default (no --synchronous/-y) never earns evidence.
+        with mock.patch.object(sfx, "_record_attributed_phase_event") as rec:
+            code, result = self.run_hook(sfx.cmd_post_test_failure, "sf apex run test -o x")
+        self.assertEqual((code, result), (0, {"continue": True}))
+        rec.assert_not_called()
+
+    def test_post_code_analyzer_self_gates_and_skips_a_host_reported_failure(self):
+        # journey-nudges Phase 6 (T6): a Tier-C "ran once" activity write must self-gate
+        # on the command AND consult the same conservative failure guard every other
+        # PostToolUse success writer uses (a failed run never earns even the mere
+        # "activity" signal).
+        with mock.patch.object(sfx, "_record_phase_event") as rec:
+            code, result = self.run_hook(sfx.cmd_post_code_analyzer, "cd /tmp && ls")
+        self.assertEqual((code, result), (0, {"continue": True}))
+        rec.assert_not_called()
+        for marker in ({"exitCode": 1}, {"interrupted": True}, {"is_error": True}):
+            with self.subTest(marker=marker):
+                payload = {"tool_input": {"command": "sf code-analyzer run"}, "tool_response": marker}
+                with mock.patch.object(sfx, "_record_phase_event") as rec:
+                    _, result = self._run_payload(sfx.cmd_post_code_analyzer, payload)
+                rec.assert_not_called()
+                self.assertEqual(result, {"continue": True})
+        with mock.patch.object(sfx, "_record_phase_event") as rec:
+            code, result = self.run_hook(sfx.cmd_post_code_analyzer, "sf code-analyzer run")
+        self.assertEqual((code, result), (0, {"continue": True}))
+        rec.assert_called_once_with(
+            "Test", "present", source="cmd_post_code_analyzer", event_type="code-analyzer")
+
 
 class ReadinessPaintTests(unittest.TestCase):
     """The check-tools readiness banner is a Tier-1 surface: after a check-tools
@@ -3326,10 +3535,11 @@ class ReadinessPaintTests(unittest.TestCase):
         self.assertIsInstance(block, str)
         self.assertIn("Ready to build on Salesforce?", strip_ansi(block))
         self.assertIn("2.50.1", strip_ansi(block))
-        # The visible paint path now colors the ✳ New here? footer (a cyan link, like the
-        # welcome/SessionStart invitation); the TABLE rows stay ANSI-free — status is dots
+        # The visible paint path now colors the ✳ New here? footer (brand bright-blue, like
+        # the welcome/SessionStart invitation); the TABLE rows stay ANSI-free — status is dots
         # + READY/WARN words, not color (owner direction 2026-08-05).
-        self.assertIn("\x1b[36m", block)                          # footer ✳ New here? is a cyan link
+        self.assertIn(sfx._SGR_BRIGHT_BLUE, block)                # footer ✳ New here? is brand bright-blue
+        self.assertNotIn("\x1b[36m", block)                       # …not the cyan link tint
         for line in block.splitlines():
             if any(w in line for w in ("READY", "WARN", "INFO", "BLOCKED")):
                 self.assertNotIn("\x1b", line)                    # dots + words are content, not ANSI
@@ -3345,7 +3555,7 @@ class ReadinessPaintTests(unittest.TestCase):
 class JourneyPaintTests(unittest.TestCase):
     """Lever C: after the MODEL runs `sf-context discover journey` (because it
     recognized a fuzzy orientation question the UserPromptSubmit regex missed), a
-    PostToolUse Bash hook paints the SAME colored rail on the visible channel and
+    PostToolUse Bash hook paints the SAME colored nudge on the visible channel and
     hands the model an "already shown — add only your read" note. Self-gates on the
     command like the wayfinder / readiness-paint (no `if:`), de-dupes against the
     same turn's UserPromptSubmit paint via the turn-scoped ledger, requires a session
@@ -3371,6 +3581,14 @@ class JourneyPaintTests(unittest.TestCase):
         os.chdir(self._prev_cwd)
         self._tmp.cleanup()
 
+    # A realistic (non-production-looking) org_display so `_gather_nudge_inputs`'
+    # is_production heuristic doesn't default to "production" purely for lack of
+    # evidence — matches the STATE fixture's implied dev-sandbox scenario.
+    ORG_DISPLAY = {
+        "alias": "acme-dev", "instanceUrl": "https://acme--dev.sandbox.my.salesforce.com/",
+        "id": "00D000000000001EAA", "isSandbox": True,
+    }
+
     def run_hook(self, command, session_id="s1", prompt_id="p1"):
         payload = {"tool_input": {"command": command}}
         if session_id is not None:
@@ -3378,7 +3596,15 @@ class JourneyPaintTests(unittest.TestCase):
         if prompt_id is not None:
             payload["prompt_id"] = prompt_id
         out = io.StringIO()
-        with mock.patch.object(sfx, "_journey_state", return_value=self.STATE), \
+        # cmd_journey_paint resolves state via `_journey_state_with_org` (not the
+        # thin `_journey_state` wrapper) so it can hand the already-resolved org
+        # display to `_select_inline_nudge` without a second probe — patch the
+        # richer seam so both the state AND the (root, org_display) tuple it needs
+        # are mocked together.
+        with mock.patch.object(
+            sfx, "_journey_state_with_org",
+            return_value=(self.STATE, Path.cwd(), self.ORG_DISPLAY),
+        ), \
                 mock.patch.object(sfx.sys, "stdin", io.StringIO(json.dumps(payload))), \
                 mock.patch.dict(os.environ, {}, clear=True), \
                 redirect_stdout(out):
@@ -3388,59 +3614,67 @@ class JourneyPaintTests(unittest.TestCase):
     def test_non_journey_command_stays_silent_including_the_json_form(self):
         # No `if:` in plugin.json (some builds fire every Bash hook on every command),
         # so the command regex is the gate — and the --json machine form (a read for
-        # the model's own reasoning) must NOT paint a rail.
+        # the model's own reasoning) must NOT paint a nudge.
         for cmd in ("cd /tmp && ls", "sf project deploy start -o x",
                     "sf-context discover where", "sf-context detect", "",
                     '"${CLAUDE_PLUGIN_ROOT}"/scripts/sf-context discover journey --json'):
             with self.subTest(cmd=cmd):
-                with mock.patch.object(sfx, "_render_journey_rail") as rj:
+                with mock.patch.object(sfx, "_render_nudge_inline") as rj:
                     code, result = self.run_hook(cmd)
                 self.assertEqual((code, result), (0, {"continue": True}))
                 rj.assert_not_called()
 
-    def test_journey_command_paints_colored_rail_and_hands_a_plain_note(self):
+    def test_journey_command_paints_colored_hints_and_hands_a_plain_note(self):
+        # journey-nudges Phase 2/8: the glyph rail is gone from this surface — it now
+        # paints the single ladder-winning graded nudge (no "Reached:" word-list). The
+        # STATE fixture (Connect/Project reached, Build not yet) with no local
+        # source on disk (a bare temp dir) makes `build.empty-scaffold` the
+        # deterministic winner — a 🚀 Try next momentum nudge.
         code, result = self.run_hook('"${CLAUDE_PLUGIN_ROOT}"/scripts/sf-context discover journey')
         self.assertEqual(code, 0)
         sysmsg = result["systemMessage"]
         self.assertTrue(sysmsg.startswith("\n"))
-        self.assertIn("\x1b[32m", sysmsg)                    # colored on the visible channel
-        self.assertIn("build", sysmsg)                       # the rail is there (cursor stage)
+        visible = strip_ansi(sysmsg)
+        self.assertNotIn("Reached:", visible)
+        self.assertIn("🚀 Try next: Project has no local source yet.", visible)
+        self.assertIn("\x1b[22m", sysmsg)                    # the nudge line is colored (body style)
         note = result["hookSpecificOutput"]["additionalContext"]
         self.assertNotIn("\x1b", note)                       # model note is plain (no ANSI)
         self.assertRegex(note, r"(?i)do not reproduce")
         self.assertNotIn("●", note)                          # never hands the glyph rail to the model
         context = sfx._prompt_context(
             {"session_id": "s1", "prompt_id": "p1"}, rotate_fallback=False)
-        self.assertTrue(sfx._rail_painted_this_turn(context))  # second call de-dupes
+        self.assertTrue(sfx._nudge_painted_this_turn(context))  # second call de-dupes
 
-    def test_dedupes_when_a_rail_already_painted_this_turn(self):
+    def test_dedupes_when_a_nudge_already_painted_this_turn(self):
         # The UserPromptSubmit orientation paint owns the atomic prompt claim, so a
-        # later journey paint cannot emit a second visible rail.
+        # later journey paint cannot emit a second visible nudge.
         context = sfx._prompt_context(
             {"session_id": "s1", "prompt_id": "p1"}, rotate_fallback=False)
-        sfx._record_rail_painted(context)
-        with mock.patch.object(sfx, "_render_journey_rail") as rj:
+        sfx._record_nudge_painted(context)
+        with mock.patch.object(sfx, "_render_nudge_inline") as rj:
             code, result = self.run_hook("sf-context discover journey")
         self.assertEqual((code, result), (0, {"continue": True}))
         rj.assert_not_called()
 
     def test_missing_session_id_stays_silent_rather_than_risk_a_double(self):
         # Without a session id the paint cannot be de-duped against the UserPromptSubmit
-        # paint, so it stays silent (the model reproduces the plain rail — today's
-        # behavior) rather than risk painting the rail twice.
-        with mock.patch.object(sfx, "_render_journey_rail") as rj:
+        # paint, so it stays silent (the model reproduces the plain nudge — today's
+        # behavior) rather than risk painting the nudge twice.
+        with mock.patch.object(sfx, "_render_nudge_inline") as rj:
             code, result = self.run_hook("sf-context discover journey", session_id=None)
         self.assertEqual((code, result), (0, {"continue": True}))
         rj.assert_not_called()
 
     def test_crash_in_the_hook_degrades_to_a_silent_continue(self):
         # Fail open: a crashing PostToolUse hook must never disrupt the turn. (Patch the
-        # renderer, not _journey_state — run_hook already mocks the latter.)
-        with mock.patch.object(sfx, "_render_journey_rail", side_effect=Exception("boom")):
+        # renderer now in use — journey-nudges Phase 2 — not _journey_state; run_hook
+        # already mocks the richer _journey_state_with_org seam.)
+        with mock.patch.object(sfx, "_render_nudge_inline", side_effect=Exception("boom")):
             code, result = self.run_hook("sf-context discover journey")
         self.assertEqual((code, result), (0, {"continue": True}))
 
-    def test_independent_skill_and_rail_markers_preserve_each_other(self):
+    def test_independent_skill_and_nudge_markers_preserve_each_other(self):
         context = sfx._prompt_context(
             {"session_id": "s1", "prompt_id": "p1"}, rotate_fallback=False)
 
@@ -3451,9 +3685,9 @@ class JourneyPaintTests(unittest.TestCase):
             with mock.patch.object(sfx.sys, "stdin", payload), redirect_stdout(io.StringIO()):
                 sfx.cmd_record_skill_dispatch()
 
-        sfx._record_rail_painted(context)
+        sfx._record_nudge_painted(context)
         dispatch_skill("platform-apex-generate")
-        self.assertTrue(sfx._rail_painted_this_turn(context))
+        self.assertTrue(sfx._nudge_painted_this_turn(context))
         self.assertIn("platform-apex-generate", sfx._dispatched_skills(context))
 
 
@@ -3464,8 +3698,8 @@ class CommandPaintTests(unittest.TestCase):
     dedicated UserPromptExpansion event (not UserPromptSubmit), carrying the command
     identity structurally; `cmd_prompt_dispatch` routes that event to
     `cmd_command_paint`, which maps (command_name, command_args) to a PAINT intent by
-    EXACT match — painting overview / rail unconditionally (an explicit solicit
-    bypasses the ambient trip-gating that keeps unsolicited rails quiet) and staying
+    EXACT match — painting overview / nudge unconditionally (an explicit solicit
+    bypasses the ambient trip-gating that keeps unsolicited nudges quiet) and staying
     silent for every probe / consent / stateful / JSON / foreign mode, mirroring the
     plugin's existing NL paint-vs-note line. Fails open."""
 
@@ -3497,6 +3731,15 @@ class CommandPaintTests(unittest.TestCase):
         os.chdir(self._prev_cwd)
         self._tmp.cleanup()
 
+    # The "hints" intent resolves via `_journey_state_with_org` (not the thin
+    # `_journey_state` wrapper) so it can hand the already-resolved org display to
+    # `_all_journey_hints` without a second probe (journey-nudges Phase 3, same seam
+    # `JourneyPaintTests.run_hook` already mocks for `cmd_journey_paint`) — patch the
+    # richer seam so both the state AND the (root, org_display) tuple it needs are
+    # mocked together, and the render never touches the real machine's org config.
+    ORG_DISPLAY = {"alias": "acme-dev", "instanceUrl": "https://acme--dev.sandbox.my.salesforce.com/",
+                   "id": "00D000000000001EAA", "isSandbox": True}
+
     def capture(self, command_args, *, command_name=None,
                 expansion_type="slash_command", event="UserPromptExpansion"):
         """Drive the real dispatch entry point with a UserPromptExpansion payload, so
@@ -3513,7 +3756,10 @@ class CommandPaintTests(unittest.TestCase):
             "prompt": ("/%s %s" % (command_name, command_args)).strip(),
         }
         out = io.StringIO()
-        with mock.patch.object(sfx, "_journey_state", return_value=self.STATE), \
+        with mock.patch.object(
+            sfx, "_journey_state_with_org",
+            return_value=(self.STATE, Path.cwd(), self.ORG_DISPLAY),
+        ), \
                 mock.patch.object(sfx.sys, "stdin", io.StringIO(json.dumps(payload))), \
                 mock.patch.dict(os.environ, {}, clear=True), \
                 redirect_stdout(out):
@@ -3523,15 +3769,22 @@ class CommandPaintTests(unittest.TestCase):
     # ---- arg → intent mapping: the exact-match twin classification ----
 
     def test_paint_args_map_to_their_intent(self):
+        # journey-nudges Phase 3: the mode label is "hints" now (the ranked nudge
+        # list), not the retired "rail"; "next"/"whats next"/"what's next" are the
+        # new primary phrasing, and "where"/"journey" remain resolving synonyms.
         for args, intent in [
             ("overview", "overview"),
             ("OVERVIEW", "overview"),        # case-insensitive
             ("  overview  ", "overview"),    # whitespace-normalized
-            ("", "rail"),                    # bare /discover
-            ("where", "rail"),
-            ("journey", "rail"),
-            ("WHERE", "rail"),
-            (" journey ", "rail"),
+            ("", "hints"),                   # bare /discover
+            ("next", "hints"),
+            ("whats next", "hints"),
+            ("what's next", "hints"),
+            ("WHAT'S NEXT", "hints"),        # case-insensitive
+            ("where", "hints"),
+            ("journey", "hints"),
+            ("WHERE", "hints"),
+            (" journey ", "hints"),
         ]:
             with self.subTest(args=args):
                 self.assertEqual(sfx._discovery_command_paint_intent(args), intent)
@@ -3540,7 +3793,7 @@ class CommandPaintTests(unittest.TestCase):
         # Probes / consent / stateful / JSON / garbage all fall through to None so the
         # command body drives them — a bug here would auto-fire an org probe or a reset
         # preview. Exact-match discipline: any trailing token defeats a paint, so the
-        # bare `journey` rail never bleeds into `journey inspect` / `journey reset …`.
+        # bare `journey` nudge never bleeds into `journey inspect` / `journey reset …`.
         for args in ("overview --json", "journey --json", "journey inspect",
                      "journey reset", "journey reset --stage Connect --scope all",
                      "plugins add a payment gateway", "features",
@@ -3559,15 +3812,21 @@ class CommandPaintTests(unittest.TestCase):
         sysmsg = result["systemMessage"]
         self.assertTrue(sysmsg.startswith("\n"))
         self.assertIn("\x1b[", sysmsg)                                # colored (NO_COLOR unset)
-        self.assertIn("what you can do here", strip_ansi(sysmsg))     # the overview, not the rail
+        self.assertIn("what you can do here", strip_ansi(sysmsg))     # the overview, not the nudge
         note = result["hookSpecificOutput"]["additionalContext"]
-        self.assertEqual(note, sfx._overview_paint_note())            # overview note, not rail note
+        self.assertEqual(note, sfx._overview_paint_note())            # overview note, not nudge note
         self.assertNotIn("\x1b", note)                               # model note is plain
         self.assertRegex(note, r"(?i)do not reproduce")
 
-    # ---- rail paints ----
+    # ---- hints paints ----
 
-    def test_rail_commands_paint_the_colored_rail_and_hand_the_orientation_note(self):
+    def test_hints_commands_paint_the_colored_ranked_list_and_hand_the_orientation_note(self):
+        # journey-nudges Phase 3: the bare/"where"/"journey" command args now paint
+        # the ranked `journey hints` list (nudge_rules.all_hints), not the glyph
+        # nudge — reusing the SAME `_journey_state_with_org` seam `capture()` mocks
+        # (no re-probe). The STATE fixture (project + org, no source yet) has no
+        # local source and no git repo, so build.empty-scaffold and project.no-git
+        # both fire — assert on that ranked content instead of the retired glyphs.
         for args in ("", "where", "journey"):
             with self.subTest(args=args):
                 code, result = self.capture(args)
@@ -3576,11 +3835,17 @@ class CommandPaintTests(unittest.TestCase):
                     result["hookSpecificOutput"]["hookEventName"], "UserPromptExpansion")
                 sysmsg = result["systemMessage"]
                 self.assertTrue(sysmsg.startswith("\n"))
-                self.assertIn("\x1b[32m", sysmsg)                     # colored on the visible channel
-                self.assertIn("build", strip_ansi(sysmsg).lower())    # the rail (cursor stage)
-                self.assertNotIn("what you can do here", strip_ansi(sysmsg))  # rail, not overview
+                self.assertIn("\x1b[", sysmsg)                        # colored on the visible channel
+                plain = strip_ansi(sysmsg)
+                self.assertIn("Hints (ranked):", plain)
+                self.assertIn("generate a component", plain)
+                self.assertNotIn("what you can do here", plain)      # hints list, not overview
                 note = result["hookSpecificOutput"]["additionalContext"]
-                self.assertEqual(note, sfx._orientation_paint_note(self.STATE))
+                # journey-nudges Phase 5: the note's "next action" text now derives
+                # from the SAME candidate the hints list is ranked from — no session
+                # id in this explicit-command path, matching production.
+                candidate = sfx._select_inline_nudge(self.STATE, Path.cwd(), self.ORG_DISPLAY)
+                self.assertEqual(note, sfx._orientation_paint_note(self.STATE, candidate=candidate))
                 self.assertNotIn("\x1b", note)                        # model note is plain
                 self.assertRegex(note, r"(?i)do not reproduce")
 
@@ -3595,7 +3860,7 @@ class CommandPaintTests(unittest.TestCase):
                      "features", "features --refresh", "--json", "wat"):
             with self.subTest(args=args):
                 with mock.patch.object(sfx, "_render_overview_paint") as ov, \
-                        mock.patch.object(sfx, "_render_journey_rail") as rj:
+                        mock.patch.object(sfx, "_render_journey_hints") as rj:
                     code, result = self.capture(args)
                 self.assertEqual((code, result), (0, {"continue": True}))
                 ov.assert_not_called()
@@ -3603,7 +3868,7 @@ class CommandPaintTests(unittest.TestCase):
 
     def test_foreign_command_name_stays_silent(self):
         with mock.patch.object(sfx, "_render_overview_paint") as ov, \
-                mock.patch.object(sfx, "_render_journey_rail") as rj:
+                mock.patch.object(sfx, "_render_journey_hints") as rj:
             code, result = self.capture("overview", command_name="other-plugin:discovery")
         self.assertEqual((code, result), (0, {"continue": True}))
         ov.assert_not_called()
@@ -3613,7 +3878,7 @@ class CommandPaintTests(unittest.TestCase):
         # An MCP-prompt expansion is not a slash command — even with a matching name and
         # a paint arg, it must not paint.
         with mock.patch.object(sfx, "_render_overview_paint") as ov, \
-                mock.patch.object(sfx, "_render_journey_rail") as rj:
+                mock.patch.object(sfx, "_render_journey_hints") as rj:
             code, result = self.capture("overview", expansion_type="mcp_prompt")
         self.assertEqual((code, result), (0, {"continue": True}))
         ov.assert_not_called()
@@ -3624,7 +3889,7 @@ class CommandPaintTests(unittest.TestCase):
     def test_command_paints_unconditionally_and_sets_no_trip_gating_markers(self):
         # A typed command is an explicit solicit: it paints every time, with no
         # welcomed/entered markers and no prompt id, and does not dedupe the way an
-        # ambient rail does — two back-to-back overview commands both paint. And it
+        # ambient nudge does — two back-to-back overview commands both paint. And it
         # writes none of the ambient trip-gating markers (nothing to gate, nothing to
         # dedupe), so the sandboxed marker / runtime dirs stay empty.
         _, first = self.capture("overview")
@@ -3650,7 +3915,7 @@ class CommandPaintTests(unittest.TestCase):
         with mock.patch.object(sfx, "_render_overview_paint", side_effect=Exception("boom")):
             code, result = self.capture("overview")
         self.assertEqual((code, result), (0, {"continue": True}))
-        with mock.patch.object(sfx, "_render_journey_rail", side_effect=Exception("boom")):
+        with mock.patch.object(sfx, "_render_journey_hints", side_effect=Exception("boom")):
             code, result = self.capture("where")
         self.assertEqual((code, result), (0, {"continue": True}))
 
@@ -3703,20 +3968,36 @@ class CommandPaintTests(unittest.TestCase):
     def test_status_family_commands_paint_their_surface_and_note(self):
         # In a project with a resolved org: each command lands on the SAME colored
         # surface its NL / SessionStart twin paints and hands the MATCHING plain note.
-        # Scope is the discriminator — /status and /welcome carry org + project + rail,
+        # Scope is the discriminator — /status and /welcome carry org + project + nudge,
         # /org carries only the org band, /project only the project band.
         Path("sfdx-project.json").write_text("{}")
-        status_note = sfx._status_paint_note(self.STATE)
+        # journey-nudges Phase 5: /status and /welcome now feed the SAME
+        # session-id-less candidate `_status_command_paint`/`_welcome_command_paint`
+        # resolve into their note (no session_id in scope there either). Resolve it
+        # under the SAME project/git mocks the actual command paint runs under below,
+        # so both sides read identical facts (real project_stats()/git_status_line()
+        # would otherwise disagree with the mocked STATUS_STATS/empty git status).
+        with mock.patch.object(sfx, "project_meta", return_value=self.STATUS_META), \
+                mock.patch.object(sfx, "project_stats", return_value=self.STATUS_STATS), \
+                mock.patch.object(sfx, "git_status_line", return_value=""):
+            status_candidate = sfx._select_inline_nudge(
+                self.STATE, Path.cwd().resolve(), self.STATUS_ORG,
+            )
+        status_note = sfx._status_paint_note(self.STATE, candidate=status_candidate)
         cases = [
-            # command_name, expected note, present (lowered), absent (lowered)
+            # command_name, expected note, present (lowered), absent (lowered).
+            # journey-nudges Phase 8: the "reached:" word-list is retired; the nudge
+            # line is now the graded band label. This sandbox has Apex source but no
+            # tests, so test.apex-no-tests (⚠️ Heads up) is the ladder winner — its
+            # band marker stands in for "the nudge line rides this surface."
             ("salesforce-development:status", status_note,
-             ("acme-dev", "sfdx project: acme-crm", "build"), ()),
+             ("acme-dev", "sfdx project: acme-crm", "⚠️ heads up:"), ("reached:",)),
             ("salesforce-development:welcome", status_note,
-             ("acme-dev", "sfdx project: acme-crm", "build"), ()),
+             ("acme-dev", "sfdx project: acme-crm", "⚠️ heads up:"), ("reached:",)),
             ("salesforce-development:org", sfx._org_paint_note(),
-             ("acme-dev",), ("sfdx project:", "build")),
+             ("acme-dev",), ("sfdx project:", "reached:", "⚠️ heads up:")),
             ("salesforce-development:project", sfx._project_paint_note(),
-             ("sfdx project: acme-crm",), ("acme-dev", "build")),
+             ("sfdx project: acme-crm",), ("acme-dev", "reached:", "⚠️ heads up:")),
         ]
         for command, note, present, absent in cases:
             with self.subTest(command=command):

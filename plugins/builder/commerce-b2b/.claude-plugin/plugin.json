@@ -1,7 +1,7 @@
 {
   "name": "commerce-b2b",
   "displayName": "Salesforce B2B Commerce Open Code",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Customize an existing Salesforce B2B Commerce storefront with the Salesforce Open Code storefront library: bring the official open-source library into site metadata, map out-of-the-box commerce definitions to storefront equivalents, and swap selected definitions. Use for B2B Commerce library integration, mapping lookup, or replacement work in Experience Builder site metadata.",
   "author": { "name": "Salesforce" },
   "license": "Apache-2.0",

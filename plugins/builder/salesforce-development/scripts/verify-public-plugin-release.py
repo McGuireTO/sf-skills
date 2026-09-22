@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Iterator, Optional
@@ -188,14 +189,38 @@ def _json_strings(value, depth: int = 0) -> Iterator[str]:
             yield from _json_strings(item, depth + 1)
 
 
+def _load_public_manifest(repo_root: Path) -> dict:
+    """Load and validate the public release manifest via the module that owns it.
+
+    The manifest-building/validation logic lives in scripts/release-ci/public-manifest.mjs
+    (JS, matching this repo's release-ci convention) rather than in capability_registry.py, so
+    this shells out to that module's ``--load`` mode instead of importing it directly.
+    """
+    script = repo_root / "scripts/release-ci/public-manifest.mjs"
+    manifest_path = repo_root / "scripts/release-ci/public-release-manifest.json"
+    try:
+        result = subprocess.run(
+            ["node", str(script), "--load", str(manifest_path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except OSError as exc:
+        raise registry.RegistryError(f"cannot load public release manifest: {exc}") from exc
+    if result.returncode != 0:
+        raise registry.RegistryError(f"cannot load public release manifest: {result.stderr.strip()}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise registry.RegistryError(f"cannot load public release manifest: {exc}") from exc
+
+
 def verify(
     plugin_root: Path, authoring_root: Path, public_root: Optional[Path] = None
 ) -> dict[str, int]:
     plugin_root = Path(plugin_root).resolve(strict=True)
     authoring_root = Path(authoring_root).resolve(strict=True)
-    public_root = Path(public_root).resolve(strict=True) if public_root is not None else None
-    manifest = registry.load_public_manifest(plugin_root / registry.PUBLIC_MANIFEST_RELATIVE)
     repo_root = authoring_root.parent
+    public_root = Path(public_root).resolve(strict=True) if public_root is not None else None
+    manifest = _load_public_manifest(repo_root)
     plugin_catalog.check(repo_root, plugin_root)
 
     public = {row["name"] for row in manifest["skills"]}

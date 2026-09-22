@@ -136,8 +136,8 @@ PLAN_EVENTS = {
     # event at all. So the allowlist keeps only the first-party dimensions; there
     # is no "command" path anymore (that parser was deleted with the sf/sfdx tier).
     "command_invoked": {"outcome", "binary", "category", "subcommand"},
-    "skill_dispatched": {"skill", "skill_domain"},
-    "agent_dispatched": {"agent_type"},
+    "skill_dispatched": {"skill", "skill_domain", "subject_plugin"},
+    "agent_dispatched": {"agent_type", "subject_plugin"},
     "exception": {"error_class", "kind"},
     "mcp_tool_used": {"mcp_server", "mcp_tool", "outcome"},
     # plugin_loaded / plugin_suggestion_declined: accept/decline halves of a
@@ -148,6 +148,10 @@ PLAN_EVENTS = {
     # signals for a known-set plugin (W-23856691), additive to the pair above.
     "plugin_recommended": {"plugin", "origin", "confidence", "surface"},
     "plugin_installed": {"plugin", "origin", "confidence", "surface"},
+    "plugin_install_result": {"plugin", "reason"},
+    # feedback: the /feedback command's structured signal. rating is a numeric
+    # 1-5. No free-text key, ever.
+    "feedback": {"rating"},
 }
 
 # Every field the envelope must attach to EVERY event (§2.2 "attached to every event").
@@ -283,7 +287,7 @@ class TelemetryCaptureTestBase(unittest.TestCase):
 
 
 class EveryEventCapturedTests(TelemetryCaptureTestBase):
-    """Each of the 7 plan events produces a well-formed, fully-enveloped line."""
+    """Each plan event produces a well-formed, fully-enveloped line."""
 
     def test_session_start(self):
         out = self.capture("session_start",
@@ -351,16 +355,83 @@ class EveryEventCapturedTests(TelemetryCaptureTestBase):
                      payload={"session_id": "S1",
                               "tool_input": {"skill": "salesforce-development:platform-apex-generate"}})
         ev = self.last("skill_dispatched")
-        self.assertEqual(ev["payload"]["skill"], "platform-apex-generate")
-        self.assertEqual(ev["payload"]["skill_domain"], "platform")
+        self.assertEqual(ev["payload"], {
+            "skill": "platform-apex-generate",
+            "skill_domain": "platform",
+        })
 
     def test_skill_dispatched_flat_name(self):
         # The real dispatch shape in this repo is a flat, unqualified name.
         self.capture("skill_dispatched",
                      payload={"session_id": "S1", "tool_input": {"skill": "platform-apex-generate"}})
         ev = self.last("skill_dispatched")
-        self.assertEqual(ev["payload"]["skill"], "platform-apex-generate")
-        self.assertEqual(ev["payload"]["skill_domain"], "platform")
+        self.assertEqual(ev["payload"], {
+            "skill": "platform-apex-generate",
+            "skill_domain": "platform",
+        })
+
+    def test_qualified_catalog_plugin_skill_and_agent_are_attributed(self):
+        catalog = {"experience-lwc": "local"}
+        with mock.patch.object(sft, "_plugin_catalog_origins", return_value=catalog):
+            self.capture("skill_dispatched", payload={
+                "session_id": "S1",
+                "tool_input": {
+                    "skill": "experience-lwc:lwc-accessibility-review",
+                    "prompt": "SECRET customer bug",
+                },
+            })
+            self.capture("agent_dispatched", payload={
+                "session_id": "S1",
+                "tool_input": {
+                    "subagent_type": "experience-lwc:lwc-reviewer",
+                    "description": "SECRET task name",
+                },
+            })
+
+        skill_events = [e for e in self.events() if e["event"] == "skill_dispatched"]
+        agent_events = [e for e in self.events() if e["event"] == "agent_dispatched"]
+        self.assertEqual(len(skill_events), 1)
+        self.assertEqual(len(agent_events), 1)
+        self.assertEqual(skill_events[0]["payload"], {
+            "skill": "lwc-accessibility-review",
+            "skill_domain": "lwc",
+            "subject_plugin": "experience-lwc",
+        })
+        self.assertEqual(agent_events[0]["payload"], {
+            "agent_type": "lwc-reviewer",
+            "subject_plugin": "experience-lwc",
+        })
+        skill_a4d = sft._to_a4d_event(skill_events[0])
+        agent_a4d = sft._to_a4d_event(agent_events[0])
+        self.assertEqual(skill_a4d["attributes"]["subjectPlugin"], "experience-lwc")
+        self.assertEqual(skill_a4d["attributes"]["skillName"], "lwc-accessibility-review")
+        self.assertEqual(agent_a4d["attributes"]["subjectPlugin"], "experience-lwc")
+        self.assertEqual(agent_a4d["attributes"]["componentId"], "lwc-reviewer")
+        self.assertNotIn("skillName", agent_a4d["attributes"])
+        self.assertNoLeak(skill_events[0])
+        self.assertNoLeak(agent_events[0])
+
+    def test_qualified_non_catalog_dispatches_are_not_recorded(self):
+        catalog = {"experience-lwc": "local"}
+        disallowed_prefixes = (
+            "google-workspace",       # third-party
+            "apps/web",               # directory-scoped
+            "held-internal-plugin",   # absent from the generated catalog
+        )
+        with mock.patch.object(sft, "_plugin_catalog_origins", return_value=catalog):
+            for prefix in disallowed_prefixes:
+                self.capture("skill_dispatched", payload={
+                    "session_id": "S1",
+                    "tool_input": {"skill": f"{prefix}:deploy"},
+                })
+                self.capture("agent_dispatched", payload={
+                    "session_id": "S1",
+                    "tool_input": {"subagent_type": f"{prefix}:review"},
+                })
+        self.assertEqual([
+            e for e in self.events()
+            if e["event"] in ("skill_dispatched", "agent_dispatched")
+        ], [])
 
     def test_non_sf_skill_dispatch_is_not_recorded(self):
         # The Skill matcher fires for EVERY session skill; a third-party / user
@@ -370,15 +441,20 @@ class EveryEventCapturedTests(TelemetryCaptureTestBase):
         self.assertEqual([e for e in self.events() if e["event"] == "skill_dispatched"], [])
 
     def test_agent_dispatched(self):
-        # OURS (shipped in agents/) is recorded verbatim; the free-form description
-        # is never captured.
-        self.capture("agent_dispatched",
-                     payload={"session_id": "S1",
-                              "tool_input": {"subagent_type": "architecture-review",
-                                             "description": "SECRET task name"}})
-        ev = self.last("agent_dispatched")
-        self.assertEqual(ev["payload"], {"agent_type": "architecture-review"})
-        self.assertNoLeak(ev)  # the free-form description must NOT be captured
+        # OURS (shipped in agents/) is recorded identically in flat and qualified
+        # form; the free-form description is never captured. salesforce-dev is the
+        # agent this plugin ships (architecture-review moved to another plugin).
+        for raw_type in ("salesforce-dev",
+                         "salesforce-development:salesforce-dev"):
+            self.capture("agent_dispatched",
+                         payload={"session_id": "S1",
+                                  "tool_input": {"subagent_type": raw_type,
+                                                 "description": "SECRET task name"}})
+            ev = self.last("agent_dispatched")
+            self.assertEqual(ev["payload"], {
+                "agent_type": "salesforce-dev",
+            })
+            self.assertNoLeak(ev)  # the free-form description must NOT be captured
 
     def test_agent_dispatched_non_plugin_emits_nothing(self):
         # The Task|Agent matcher fires for EVERY subagent — built-ins, other plugins,
@@ -505,6 +581,10 @@ class EveryEventCapturedTests(TelemetryCaptureTestBase):
                 "plugin": "agentforce-adlc", "confidence": "high", "surface": "session-start"}})
             self.capture("plugin_installed", payload={"session_id": "S1", "tool_input": {
                 "plugin": "agentforce-adlc", "confidence": "none", "surface": "self-directed"}})
+        self.capture("plugin_install_result", payload={"session_id": "S1", "tool_input": {
+            "reason": "subprocess_failure"}})
+        self.capture("feedback", payload={"session_id": "S1", "tool_input": {
+            "rating": 4}})
         self.capture("session_end", payload={"session_id": "S1"})
         seen = {e["event"] for e in self.events()}
         self.assertEqual(seen, set(PLAN_EVENTS), "not every plan event reached the buffer")
@@ -591,6 +671,180 @@ class EveryEventCapturedTests(TelemetryCaptureTestBase):
             self.assertEqual([e for e in self.events()
                               if e["event"] in ("plugin_recommended", "plugin_installed")], [],
                              "recommend/install events must honor their closed vocabularies")
+
+    def test_plugin_install_result_accepts_only_closed_vocabulary(self):
+        with mock.patch.object(
+                sft, "_plugin_catalog_origins",
+                return_value={"agentforce-adlc": "external"}):
+            for reason in sorted(sft._PLUGIN_INSTALL_REASONS):
+                self.capture("plugin_install_result", payload={
+                    "session_id": "S1", "tool_input": {
+                        "plugin": "agentforce-adlc", "reason": reason}})
+                self.assertEqual(
+                    self.last("plugin_install_result")["payload"],
+                    {"plugin": "agentforce-adlc", "reason": reason},
+                )
+
+            self.capture("plugin_install_result", payload={
+                "session_id": "S1", "tool_input": {
+                    "plugin": "alice@example.com", "reason": "unknown_plugin"}})
+            self.assertEqual(
+                self.last("plugin_install_result")["payload"],
+                {"plugin": "unknown", "reason": "unknown_plugin"},
+            )
+
+        before = len(self.events())
+        for unsafe in ("network error for alice@example.com", "../secret", "", None):
+            self.capture("plugin_install_result", payload={
+                "session_id": "S1", "tool_input": {"reason": unsafe}})
+        self.assertEqual(len(self.events()), before,
+                         "unknown/free-form install reasons must be dropped")
+
+
+class FeedbackEventTests(TelemetryCaptureTestBase):
+    """The /feedback command's rating-only signal. HARD INVARIANT under test
+    here: telemetry never carries free text -- an invalid rating, or an extra
+    free-text-shaped key, must never reach `.sf/telemetry-buffer-*.jsonl`,
+    however it is passed to capture_event."""
+
+    def test_valid_rating_is_captured(self):
+        # Exercise the full 1-5 range, not just one interior value -- a
+        # regression that narrowed the accepted range (e.g. dropping 1)
+        # would otherwise slip through untested.
+        for good_rating in (1, 2, 3, 4, 5):
+            self.capture("feedback", payload={"session_id": "S1", "tool_input": {
+                "rating": good_rating}})
+            ev = self.last("feedback")
+            self.assertEqual(ev["payload"], {"rating": good_rating})
+
+    def test_out_of_range_rating_is_dropped(self):
+        for bad_rating in (0, -1, 6, 100):
+            self.capture("feedback", payload={"session_id": "S1", "tool_input": {
+                "rating": bad_rating}})
+        self.assertEqual([e for e in self.events() if e["event"] == "feedback"], [],
+                          "an out-of-range rating must never be captured")
+
+    def test_non_int_rating_is_dropped(self):
+        # A bool is technically an int subclass in Python -- explicitly reject it.
+        # Floats are rejected too: a 1-5 rating is a discrete scale, and allowing
+        # floats would open a channel that can encode far more than 5 values.
+        for bad_rating in ("4", None, [4], True, False, "not a number", 4.5, 4.0):
+            self.capture("feedback", payload={"session_id": "S1", "tool_input": {
+                "rating": bad_rating}})
+        self.assertEqual([e for e in self.events() if e["event"] == "feedback"], [],
+                          "a non-int rating must never be captured")
+
+    def test_free_text_comment_never_reaches_the_buffer(self):
+        """The load-bearing HARD-INVARIANT test: even if a caller attaches a
+        free-text-shaped key (e.g. an accidental "comment"), it must never appear
+        in the on-disk telemetry buffer -- only the validated rating does."""
+        secret_text = "some free text with a path /Users/foo/bar and SECRET=1"
+        self.capture("feedback", payload={"session_id": "S1", "tool_input": {
+            "rating": 4, "comment": secret_text,
+            "notes": secret_text, "free_text": secret_text,
+        }})
+        ev = self.last("feedback")
+        # Only the allowlisted field survives -- no "comment"/"notes"/etc. key.
+        self.assertEqual(ev["payload"], {"rating": 4})
+        for buf in self.buffers():
+            blob = buf.read_text(encoding="utf-8")
+            self.assertNotIn(secret_text, blob,
+                              "free text must never land in the telemetry buffer")
+            self.assertNotIn("comment", blob,
+                              "no free-text-shaped key may survive into the buffer")
+        self.assertNoLeak(self.events())
+
+    def test_free_text_alone_with_no_valid_rating_drops_the_whole_event(self):
+        # A caller that supplies ONLY free text (no rating at all) must not get
+        # a stripped-down event either -- the whole capture is dropped.
+        secret_text = "acme-prod customer bug https://internal.example/x"
+        self.capture("feedback", payload={"session_id": "S1", "tool_input": {
+            "comment": secret_text,
+        }})
+        self.assertEqual([e for e in self.events() if e["event"] == "feedback"], [],
+                          "a feedback capture with no valid rating must be dropped entirely")
+
+
+class FeedbackRecordCommandTests(TelemetryCaptureTestBase):
+    """`feedback-eligibility` / `feedback-record` -- the dedicated, non-piped
+    subcommands /salesforce-development:feedback calls instead of the old
+    `echo ... | telemetry-capture feedback` pipeline. Under test: the command
+    reports an ACCURATE outcome (recorded only once the event is actually
+    committed; skipped/error otherwise), and reads the session id itself from
+    CLAUDE_CODE_SESSION_ID rather than requiring the caller to interpolate it."""
+
+    def eligibility(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = sft.cmd_feedback_eligibility(["sf-context", "feedback-eligibility"])
+        self.assertEqual(rc, 0)
+        return json.loads(buf.getvalue())
+
+    def record(self, raw_rating, session_id="S1"):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = session_id
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = sft.cmd_feedback_record(["sf-context", "feedback-record", str(raw_rating)])
+        self.assertEqual(rc, 0)
+        return json.loads(buf.getvalue())
+
+    def test_eligible_by_default(self):
+        self.assertEqual(self.eligibility(), {"eligible": True})
+
+    def test_valid_rating_is_recorded_and_reported_accurately(self):
+        out = self.record(4, session_id="S1")
+        self.assertEqual(out, {"result": "recorded"})
+        ev = self.last("feedback")
+        self.assertEqual(ev["payload"], {"rating": 4})
+
+    def test_record_reads_session_id_from_environment_not_the_cli_arg(self):
+        # No session id is passed on argv -- only the rating. The command must
+        # source it from CLAUDE_CODE_SESSION_ID itself (the whole point of the
+        # dedicated subcommand: no shell variable expansion in the invocation).
+        self.record(5, session_id="env-session-1")
+        buf = Path(".sf") / "telemetry-buffer-env-session-1.jsonl"
+        self.assertTrue(buf.exists(), "the event must land in the env-sourced session's buffer")
+
+    def test_out_of_range_or_non_integer_rating_is_an_error_and_not_recorded(self):
+        for raw in ("0", "-1", "6", "100", "4.5", "abc", ""):
+            out = self.record(raw, session_id="S1")
+            self.assertEqual(out, {"result": "error", "reason": "invalid_rating"}, raw)
+        self.assertEqual([e for e in self.events() if e["event"] == "feedback"], [],
+                          "an invalid rating must never be recorded")
+
+    def test_telemetry_off_is_reported_as_skipped_not_success(self):
+        self.consent("off")
+        self.assertEqual(self.eligibility(), {"eligible": False, "reason": "telemetry_disabled"})
+        out = self.record(4, session_id="S1")
+        self.assertEqual(out, {"result": "skipped", "reason": "telemetry_disabled"})
+        self.assertEqual([e for e in self.events() if e["event"] == "feedback"], [],
+                          "a rating must not be recorded once telemetry is off")
+
+    def test_env_optout_is_reported_as_skipped(self):
+        os.environ["SF_DISABLE_TELEMETRY"] = "true"
+        self.assertEqual(self.eligibility(), {"eligible": False, "reason": "telemetry_disabled"})
+        out = self.record(4, session_id="S1")
+        self.assertEqual(out, {"result": "skipped", "reason": "telemetry_disabled"})
+
+    def test_outside_sf_project_is_reported_as_skipped_with_that_reason(self):
+        Path("sfdx-project.json").unlink()
+        self.assertEqual(self.eligibility(), {"eligible": False, "reason": "not_sf_project"})
+        out = self.record(4, session_id="S1")
+        self.assertEqual(out, {"result": "skipped", "reason": "not_sf_project"})
+
+    def test_dispatch_routes_both_feedback_subcommands(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = sft.dispatch(["sf-context", "feedback-eligibility"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue()), {"eligible": True})
+
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "S1"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = sft.dispatch(["sf-context", "feedback-record", "3"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue()), {"result": "recorded"})
 
 
 class EnvelopeTests(TelemetryCaptureTestBase):
@@ -760,6 +1014,21 @@ class ConsentTests(TelemetryCaptureTestBase):
         self.assertTrue(sft._is_enabled())
         self.capture("session_start", payload={"session_id": "S1"})
         self.assertEqual(len(self.events()), 1)
+
+    def test_catalog_dispatch_honors_all_opt_outs(self):
+        dispatch = {"session_id": "S1", "tool_input": {
+            "skill": "experience-lwc:lwc-accessibility-review"}}
+        catalog = {"experience-lwc": "local"}
+        with mock.patch.object(sft, "_plugin_catalog_origins", return_value=catalog):
+            self.consent("off")
+            self.capture("skill_dispatched", payload=dispatch)
+            self.assertFalse(self.buffers())
+            self.consent("on")
+
+            for var in ("SF_DISABLE_TELEMETRY", "DO_NOT_TRACK"):
+                with self.subTest(var=var), mock.patch.dict(os.environ, {var: "1"}):
+                    self.capture("skill_dispatched", payload=dispatch)
+                    self.assertFalse(self.buffers())
 
     def test_hard_off_discards_buffer_and_blocks_capture(self):
         self.capture("session_start", payload={"session_id": "S1"})
@@ -1280,7 +1549,7 @@ class DisclosureGateTests(TelemetryCaptureTestBase):
 
     def test_no_capture_before_notice_shown(self):
         # Simulate a session whose FIRST telemetry activity is a non-session event
-        # (e.g. compact ui_mode where the banner never rendered, or a hook order
+        # (e.g. off ui_mode where the banner never rendered, or a hook order
         # where a PostToolUse fires before we recorded the notice). With no notice
         # marker, capture must record NOTHING — disclosure has not happened yet.
         sft._notified_file().unlink(missing_ok=True)
@@ -1390,6 +1659,25 @@ class SessionEndTests(TelemetryCaptureTestBase):
         s2 = [e for e in self.events() if e["event"] == "session_end" and e["session_id"] == "S2"][-1]
         self.assertEqual(s2["payload"]["event_count"], 1, "S2 count must exclude S1's events")
 
+    def test_event_count_excludes_catalog_plugin_dispatches(self):
+        self.capture("session_start", payload={"session_id": "S1"})
+        self.capture("skill_dispatched", payload={
+            "session_id": "S1",
+            "tool_input": {"skill": "salesforce-development:platform-apex-generate"},
+        })
+        with mock.patch.object(
+                sft, "_plugin_catalog_origins", return_value={"experience-lwc": "local"}):
+            self.capture("skill_dispatched", payload={
+                "session_id": "S1",
+                "tool_input": {"skill": "experience-lwc:lwc-accessibility-review"},
+            })
+            self.capture("agent_dispatched", payload={
+                "session_id": "S1",
+                "tool_input": {"subagent_type": "experience-lwc:lwc-reviewer"},
+            })
+        self.capture("session_end", payload={"session_id": "S1"})
+        self.assertEqual(self.last("session_end")["payload"]["event_count"], 2)
+
     def test_missing_marker_yields_zero_duration(self):
         # session_end with no prior session_start marker -> duration 0, never raises.
         self.capture("session_end", payload={"session_id": "orphan"})
@@ -1465,9 +1753,15 @@ class ManifestWiringTests(unittest.TestCase):
     # slot _session_start_plugin_slot (recommend) and cmd_plugin_install (install) --
     # never a `telemetry-capture
     # <event>` manifest hook, so this substring scan has nothing to find for them.
+    # feedback is likewise never a manifest hook: it's an in-process
+    # capture_event(...) call from the /feedback command's rating-capture step
+    # (commands/feedback.md -> sf-context telemetry-capture feedback), not a
+    # SessionStart/PreToolUse/etc. lifecycle hook, so this substring scan has
+    # nothing to find for it either.
     _NEVER_HOOK_WIRED = {
         "plugin_loaded", "plugin_suggestion_declined",
-        "plugin_recommended", "plugin_installed",
+        "plugin_recommended", "plugin_installed", "plugin_install_result",
+        "feedback",
     }
 
     def test_every_plan_event_is_wired(self):
@@ -1606,6 +1900,9 @@ class PdpMappingTests(TelemetryCaptureTestBase):
                               "confidence": "high", "surface": "session-start"},
             "plugin_installed": {"plugin": "agentforce-adlc", "origin": "external",
                               "confidence": "none", "surface": "self-directed"},
+            "plugin_install_result": {"plugin": "agentforce-adlc",
+                                      "reason": "subprocess_failure"},
+            "feedback": {"rating": 4},
         }
         produced = {}
         for event, payload in cases.items():
@@ -1633,12 +1930,26 @@ class PdpMappingTests(TelemetryCaptureTestBase):
         self.assertEqual(produced["plugin_installed"]["eventName"], "plugin.installed")
         self.assertEqual(produced["plugin_installed"]["contextValue"],
                          "external::none::self-directed")
+        self.assertEqual(produced["plugin_install_result"], {
+            "productFeatureId": "aJCEE000000SLW94AO",
+            "eventName": "pluginInstall.completed",
+            "componentId": "agentforce-adlc",
+            "contextName": "reason",
+            "contextValue": "subprocess_failure",
+        })
         # session.started keeps the model as componentId (original design) AND now
         # also carries it in the context tuple for a consistent model dimension.
         self.assertEqual(produced["session_start"]["componentId"], "claude-opus-4-8")
         self.assertEqual(produced["session_start"]["contextName"], "os::org_bucket::model")
         self.assertEqual(produced["session_start"]["contextValue"],
                          "darwin::production::claude-opus-4-8")
+        # feedback rides the rigid PDP shape: rating -> eventVolume (a genuine
+        # numeric metric), no per-event context dimension. No free-text field
+        # exists on this shape for a comment to ride even if one were passed.
+        self.assertEqual(produced["feedback"]["eventName"], "feedback.submitted")
+        self.assertEqual(produced["feedback"]["eventVolume"], 4)
+        self.assertEqual(produced["feedback"]["contextName"], "")
+        self.assertEqual(produced["feedback"]["contextValue"], "")
 
     def test_first_party_subcommand_becomes_component(self):
         ev = self._pdp(self._record("command_invoked",
@@ -1654,6 +1965,21 @@ class PdpMappingTests(TelemetryCaptureTestBase):
         ev = self._pdp(self._record("command_invoked",
                        {"binary": "other", "category": "other", "outcome": "failure"}))
         self.assertEqual(ev["componentId"], "other")
+
+    def test_plugin_install_result_is_revalidated_at_egress(self):
+        self.assertIsNone(sft._to_pdp_event(self._record(
+            "plugin_install_result", {
+                "plugin": "agentforce-adlc",
+                "reason": "network failed for alice@example.com",
+            })))
+        with mock.patch.object(
+                sft, "_plugin_catalog_origins",
+                return_value={"agentforce-adlc": "external"}):
+            ev = sft._to_pdp_event(self._record(
+                "plugin_install_result",
+                {"plugin": "alice@example.com", "reason": "unknown_plugin"},
+            ))
+        self.assertEqual(ev["componentId"], "unknown")
 
     def test_unknown_record_is_skipped(self):
         self.assertIsNone(sft._to_pdp_event({"event": "not_real", "payload": {}}))
@@ -1875,13 +2201,47 @@ class A4dDatasetAlignmentTests(unittest.TestCase):
             attrs = sft._to_a4d_event(self._record(event, payload))["attributes"]
             self.assertNotIn("skillName", attrs, msg=f"skillName leaked onto {event}")
 
+    def test_subject_plugin_only_on_dispatch_events(self):
+        skill = self._record("skill_dispatched", {
+            "skill": "lwc-accessibility-review",
+            "skill_domain": "lwc",
+            "subject_plugin": "experience-lwc",
+        })
+        agent = self._record("agent_dispatched", {
+            "agent_type": "lwc-reviewer",
+            "subject_plugin": "experience-lwc",
+        })
+        self.assertEqual(
+            sft._to_a4d_event(skill)["attributes"]["subjectPlugin"], "experience-lwc")
+        self.assertEqual(
+            sft._to_a4d_event(agent)["attributes"]["subjectPlugin"], "experience-lwc")
+        command = self._record("command_invoked", {
+            "binary": "sf-context", "category": "plugin_command",
+            "subcommand": "status-org", "outcome": "success",
+        })
+        self.assertNotIn("subjectPlugin", sft._to_a4d_event(command)["attributes"])
+
+    def test_prechange_salesforce_dispatch_defaults_to_salesforce_subject(self):
+        # Buffered rows written by the prior collector have no subject_plugin.
+        # They were necessarily Salesforce Development dispatches, and every
+        # pre-existing wire dimension remains unchanged alongside the new field.
+        rec = self._record("skill_dispatched", {
+            "skill": "platform-apex-generate", "skill_domain": "platform"})
+        a4d = sft._to_a4d_event(rec)
+        self.assertEqual(a4d["attributes"].pop("subjectPlugin"),
+                         "salesforce-development")
+        self.assertEqual(a4d["attributes"]["componentId"], "platform-apex-generate")
+        self.assertEqual(a4d["attributes"]["contextName"], "skill_domain")
+        self.assertEqual(a4d["attributes"]["contextValue"], "platform")
+        self.assertEqual(a4d["attributes"]["skillName"], "platform-apex-generate")
+
     def test_alignment_keys_are_a4d_only_never_on_pdp(self):
         # Same guarantee as org_id: these four keys must never appear on the fixed
         # PDP shape — they are UIP dataset-alignment only.
         rec = self._record("skill_dispatched",
                            {"skill": "platform-apex-generate", "skill_domain": "platform"})
         pdp_blob = json.dumps(sft._to_pdp_event(rec))
-        for key in ("skillSource", "modelId", "user_Id", "skillName"):
+        for key in ("skillSource", "modelId", "user_Id", "skillName", "subjectPlugin"):
             self.assertNotIn(key, pdp_blob, msg=f"{key} leaked onto PDP")
 
     def test_harness_on_uip_only(self):
@@ -1983,6 +2343,8 @@ class GoldenWireShapeTests(unittest.TestCase):
         "session_end": {"duration_ms": 2500, "event_count": 7},
         "command_invoked": {"binary": "sf-context", "category": "plugin_command",
                             "subcommand": "status-org", "outcome": "success"},
+        "plugin_install_result": {"plugin": "agentforce-adlc",
+                                  "reason": "subprocess_failure"},
         "skill_dispatched": {"skill": "platform-apex-generate", "skill_domain": "platform"},
         "agent_dispatched": {"agent_type": "code-review"},
         "exception": {"error_class": "rate_limit", "kind": "api_error"},
@@ -2006,6 +2368,10 @@ class GoldenWireShapeTests(unittest.TestCase):
                 "productFeatureId": self.PFID, "eventName": "command.invoked",
                 "componentId": "sf-context.status-org",
                 "contextName": "outcome::category", "contextValue": "success::plugin_command"},
+            "plugin_install_result": {
+                "productFeatureId": self.PFID, "eventName": "pluginInstall.completed",
+                "componentId": "agentforce-adlc",
+                "contextName": "reason", "contextValue": "subprocess_failure"},
             "skill_dispatched": {
                 "productFeatureId": self.PFID, "eventName": "skill.dispatched",
                 "componentId": "platform-apex-generate",
@@ -2050,11 +2416,15 @@ class GoldenWireShapeTests(unittest.TestCase):
                 **self._uip_common("sf-context.status-org", "outcome::category",
                                    "success::plugin_command"),
                 "commandSurface": "user"}},
+            "plugin_install_result": {"eventName": "pluginInstall.completed", "attributes":
+                self._uip_common("agentforce-adlc", "reason", "subprocess_failure")},
             "skill_dispatched": {"eventName": "skill.dispatched", "attributes": {
                 **self._uip_common("platform-apex-generate", "skill_domain", "platform"),
-                "skillName": "platform-apex-generate"}},
+                "skillName": "platform-apex-generate",
+                "subjectPlugin": "salesforce-development"}},
             "agent_dispatched": {"eventName": "agent.dispatched", "attributes":
-                self._uip_common("code-review", "org_bucket", "production")},
+                {**self._uip_common("code-review", "org_bucket", "production"),
+                 "subjectPlugin": "salesforce-development"}},
             "exception": {"eventName": "exception.raised", "attributes":
                 self._uip_common("rate_limit", "kind", "api_error")},
             "mcp_tool_used": {"eventName": "mcpTool.used", "attributes":
@@ -2679,6 +3049,52 @@ class TransmitTests(TelemetryCaptureTestBase):
         self.assertEqual(s2_sessions, {"S2"})
         self.assertFalse(list(Path(".sf").glob("telemetry-buffer-*.jsonl")),
                          "both sessions' buffers are fully drained")
+
+    def test_flush_sweeps_orphan_session_less_buffer(self):
+        # Regression: a capture with no session_id (e.g. an older /feedback build's
+        # telemetry-capture call before it passed $CLAUDE_CODE_SESSION_ID) lands in
+        # the shared "nosession" buffer. No session's own SessionEnd is ever
+        # addressed to that file, so without a sweep it would be stranded forever.
+        # ANY flush must pick it up and ship it, regardless of which real session
+        # is ending.
+        self.capture("feedback", payload={"tool_input": {"rating": 5}})
+        self.assertTrue(Path(".sf/telemetry-buffer-nosession.jsonl").exists())
+        self._seed_session()  # S1: an unrelated, real session
+        sender = mock.Mock(return_value=True)
+        self._run_flush(sender)  # S1 ends; must also sweep the orphan buffer
+        self.assertEqual(sender.call_count, 2,
+                         "S1's own flush and the orphan sweep must each spawn a sender")
+        snapshots = [Path(c.args[0]) for c in sender.call_args_list]
+        orphan_snap = next(p for p in snapshots if "orphan" in p.name)
+        names = [json.loads(l)["event"] for l in orphan_snap.read_text().splitlines() if l.strip()]
+        self.assertEqual(names, ["feedback"])
+        self.assertFalse(Path(".sf/telemetry-buffer-nosession.jsonl").exists(),
+                         "the orphan buffer must be drained, not left behind")
+
+    def test_flush_without_orphan_buffer_spawns_only_once(self):
+        # The sweep must be a true no-op when there is nothing session-less
+        # buffered -- no extra snapshot, no extra spawn, no crash.
+        self._seed_session()
+        sender = mock.Mock(return_value=True)
+        self._run_flush(sender)
+        self.assertEqual(sender.call_count, 1)
+        self.assertFalse(list(Path(".sf").glob("telemetry-snapshot-*-orphan.jsonl")))
+
+    def test_feedback_with_session_id_flushes_with_its_own_session(self):
+        # The fix at the source: /feedback now passes session_id, so its capture
+        # joins the calling session's own buffer and ships with the rest of that
+        # session's events -- no orphan buffer is created at all, so no separate
+        # sweep-spawn is needed for it.
+        self._seed_session()  # S1: session_start, skill, command
+        self.capture("feedback", payload={"session_id": "S1", "tool_input": {
+            "rating": 5}})
+        self.assertFalse(Path(".sf/telemetry-buffer-nosession.jsonl").exists())
+        sender = mock.Mock(return_value=True)
+        self._run_flush(sender)
+        self.assertEqual(sender.call_count, 1, "no orphan buffer -> no extra sweep spawn")
+        snap = Path(sender.call_args.args[0])
+        names = [json.loads(l)["event"] for l in snap.read_text().splitlines() if l.strip()]
+        self.assertIn("feedback", names)
 
     def test_sender_builds_job_and_spawns_flusher_then_deletes_snapshot(self):
         # The detached sender (cmd_send) is where org resolution + upload happen.

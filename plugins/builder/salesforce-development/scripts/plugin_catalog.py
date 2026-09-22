@@ -386,7 +386,7 @@ _GENERIC_MATCH_TERMS = frozenset({
     "a", "add", "an", "and", "app", "are", "as", "at", "be", "build", "by", "can",
     "create", "do", "edit", "find", "for", "from", "generate", "have", "i",
     "in", "is", "it", "make", "me", "my", "need", "of", "on", "or", "please",
-    "salesforce", "search", "that", "the", "this", "to", "use", "want", "we",
+    "salesforce", "search", "show", "that", "the", "this", "to", "use", "want", "we",
     "with", "you", "your",
 })
 

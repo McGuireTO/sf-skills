@@ -87,6 +87,7 @@ else
 fi
 
 # --- explicit discovery routes each new product boundary at high confidence -
+t1_idx=0
 for match_case in \
   "dx-org-lifecycle|configure post-copy steps for my Salesforce sandbox refresh" \
   "dx-org-lifecycle|enable Dev Hub and show my scratch org allocation" \
@@ -96,9 +97,11 @@ for match_case in \
   "mobile-development|use lightning/mobileCapabilities to add native barcode scanner support" \
   "platform-observability|turn on TraceSpanEvent publishing with enablePlatformTracing" \
   "dx-isv-partner|AppAnalyticsQueryRequest PackageUsageSummary SubscriberSnapshot"; do
+  t1_idx=$((t1_idx + 1))
   expected="${match_case%%|*}"
   prompt="${match_case#*|}"
-  OUT_TRANCHE=$("$CTX" plugin-match --json --surface discovery-command "$prompt")
+  OUT_TRANCHE=$("$CTX" plugin-match --json --surface discovery-command \
+    --session-id "plugin-match-tranche1-$$-${t1_idx}-$RANDOM" "$prompt")
   if printf '%s' "$OUT_TRANCHE" | python3 -c '
 import json,sys
 expected=sys.argv[1]
@@ -114,13 +117,16 @@ done
 # --- W-23856691 tranche 2: service-engagement, integration, ----------------
 # platform-lightning-widgets, each isolated on a mandated positive example that
 # has no pre-existing token overlap with another plugin's vocabulary.
+t2_idx=0
 for match_case in \
   "service-engagement|set up a Salesforce Digital Engagement messaging channel" \
   "integration|configure a Salesforce Connected App for OAuth" \
   "platform-lightning-widgets|generate a custom Salesforce Lightning Type"; do
+  t2_idx=$((t2_idx + 1))
   expected="${match_case%%|*}"
   prompt="${match_case#*|}"
-  OUT_TRANCHE2=$("$CTX" plugin-match --json --surface discovery-command "$prompt")
+  OUT_TRANCHE2=$("$CTX" plugin-match --json --surface discovery-command \
+    --session-id "plugin-match-tranche2-$$-${t2_idx}-$RANDOM" "$prompt")
   if printf '%s' "$OUT_TRANCHE2" | python3 -c '
 import json,sys
 expected=sys.argv[1]

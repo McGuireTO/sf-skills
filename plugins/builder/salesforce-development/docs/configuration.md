@@ -13,9 +13,11 @@ Ambient SessionStart output is configured by plugin `userConfig.ui_mode` (transp
 | Mode | Ambient SessionStart and wayfinding |
 |---|---|
 | `full` (default) | signature banner and evidence rail |
-| `compact` | one bounded project/stage/next line |
-| `plain` | semantic text without ANSI or journey glyphs |
+| `plain` | accessible semantic text, without ANSI color or journey glyphs |
 | `off` | hidden |
+
+The retired `compact` mode maps to `plain` (the nearest surviving reduced-chrome surface), so a
+saved `compact` preference keeps reduced output rather than reverting to the full banner.
 
 `NO_COLOR` removes ANSI without changing mode. Explicit status, setup, discovery, safety
 advisories/gates, failures, and install guidance remain available in every mode.

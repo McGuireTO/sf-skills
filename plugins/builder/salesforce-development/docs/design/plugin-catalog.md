@@ -58,15 +58,30 @@ Two properties are load-bearing and easy to erode by accident during future edit
   invoking it is itself sufficient intent. This keeps a globally installed foundation plugin from
   presuming that an unrelated React tree or a generic media request is Salesforce work. One further
   out-of-project path exists and is deliberately narrow: when a user with no project names Salesforce
-  or CRM (its product category), the getting-started welcome fires, and that welcome reuses the *same* UserPromptSubmit
+  or CRM (its product category), the getting-started note fires, and that note reuses the *same* UserPromptSubmit
   scorer at its full proactive bar (high band + `require_anchor_terms=True`) to fold at most a
-  one-line install recommendation into the welcome it is already painting. Naming the product or its category out of
-  a project is the sufficient-intent signal here — the exact parallel to explicit discovery — but the
-  high+anchor bar still governs, so a bare product-cue mention (`salesforce` / `crm`) with no strong capability match adds
-  nothing. It is install-only (like SessionStart it never points at an installed plugin's command)
-  and opens the same one decision workflow, so a subsequent sole-candidate `yes` installs through the
-  ordinary accepted-proposal path. This is not a fifth surface: it is the UserPromptSubmit proactive
-  match reached from the getting-started branch, so every evidence-bar knob is identical.
+  one-line install recommendation into itself. Since the entered-project-splash plan (Change 2) that
+  getting-started surface is **model-facing only** — it rides `additionalContext`, never a visible paint —
+  so the recommendation is re-homed onto that model channel too: `_prompt_plugin_recommendation_surface`
+  is called with `shown_to_user=False` (its framing then states the match was found but *not* displayed,
+  and gates the relay on genuine build intent), and the visible half of its return is discarded. Naming
+  the product or its category out of a project is the sufficient-intent signal here — the exact parallel to
+  explicit discovery — but the high+anchor bar still governs, so a bare product-cue mention (`salesforce` /
+  `crm`) with no strong capability match adds nothing. It is install-only (like SessionStart it never points
+  at an installed plugin's command) and opens the same one decision workflow, so a subsequent sole-candidate
+  `yes` installs through the ordinary accepted-proposal path. This is not a fifth surface: it is the
+  UserPromptSubmit proactive match reached from the getting-started branch, so every evidence-bar knob is
+  identical. (The visible getting-started welcome that used to paint this rec is gone — the sole visible
+  out-of-project splash is now the scaffold-success paint.)
+- **The scaffold-success paint persists the project type it observed.** The splash project header reads
+  `name · type · API version`, where the type is the `sf project generate --template` value. The SF CLI
+  stores that nowhere, so `cmd_scaffold_paint` writes the observed template into the created
+  `sfdx-project.json`'s top-level `template` key (`_persist_scaffold_template`) — **only on an observed
+  generate, and only when the key is absent**. Every other read is read-only (`_project_type_from_descriptor`),
+  so a project we merely open is never touched and one with no `template` key simply shows no type (we never
+  sniff to guess it). Add-only means the write becomes a no-op the day a future SF CLI writes `template`
+  itself — the CLI's value then flows through unchanged. A tracked descriptor key (not a machine-local `.sf`
+  sidecar) was chosen so the type survives a clone and is shared with teammates.
 - **Installation state never changes confidence — it decides eligibility only.** BM25 scores use the
   stable registry add-on corpus, then enabled plugins are removed from the returned candidates.
   Filtering the scoring corpus first changes IDF and can promote a weak neighboring match from medium
