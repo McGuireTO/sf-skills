@@ -1,3 +1,12 @@
+# [1.65.0](https://github.com/forcedotcom/sf-skills/compare/1.64.0...1.65.0) (2026-10-15)
+
+
+### Features
+
+* Release 863 skills (47 new, 816 updated, 1 removed) - headless360Mcp-only public @W-24535066@ ([47e2526](https://github.com/forcedotcom/sf-skills/commit/47e252633e6ac06b83e3cdda36e001c836f5e404))
+
+
+
 # [1.64.0](https://github.com/forcedotcom/sf-skills/compare/1.63.0...1.64.0) (2026-10-15)
 
 
