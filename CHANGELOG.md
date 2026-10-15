@@ -1,3 +1,12 @@
+## [1.65.1](https://github.com/forcedotcom/sf-skills/compare/1.65.0...1.65.1) (2026-10-15)
+
+
+### Reverts
+
+* "Release 863 skills" public release changes @W-24535066@ ([#373](https://github.com/forcedotcom/sf-skills/issues/373)) ([dcdcb4a](https://github.com/forcedotcom/sf-skills/commit/dcdcb4a0be6eddd65da8f976941301010b7267f9))
+
+
+
 # [1.65.0](https://github.com/forcedotcom/sf-skills/compare/1.64.0...1.65.0) (2026-10-15)
 
 
