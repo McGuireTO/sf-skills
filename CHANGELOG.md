@@ -1,3 +1,13 @@
+# [1.63.0](https://github.com/forcedotcom/sf-skills/compare/1.62.0...1.63.0) (2026-10-15)
+
+
+### Features
+
+* Add owner and string accessCheck to the 3 skills demoted in this release @W-24535066@ ([10e1256](https://github.com/forcedotcom/sf-skills/commit/10e1256cc7f14bcefec71f1987e81f285041a70d))
+* Plugins release 2.4.0 (promotion to main) @W-24472929@ ([4bbae5c](https://github.com/forcedotcom/sf-skills/commit/4bbae5c421e51b40e4169afa72c4496372a602a7))
+
+
+
 # [1.62.0](https://github.com/forcedotcom/sf-skills/compare/1.61.0...1.62.0) (2026-10-09)
 
 
