@@ -276,6 +276,15 @@ printf '%s' "{\"session_id\":\"$SID-dg\",\"prompt_id\":\"p3\",\"tool_input\":{\"
   | "$CTX" record-skill-dispatch >/dev/null
 check quiet - "sf data query allowed after platform-data-manage dispatch (delegate, F3)" "$QUERY_S3"
 
+# forcedotcom/sf-skills#359 — platform-destructive-deploy writes its own
+# destructiveChangesPre/Post.xml (Step 1c), so its dispatch satisfies the
+# platform-manifest-generate deny instead of blocking the skill's own step.
+DESTRUCT_S3="{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"manifest/destructiveChangesPost.xml\"},\"session_id\":\"$SID-dd\",\"prompt_id\":\"p3\"}"
+check_deny platform-manifest-generate "Write destructiveChangesPost.xml denies before dispatch" "$DESTRUCT_S3"
+printf '%s' "{\"session_id\":\"$SID-dd\",\"prompt_id\":\"p3\",\"tool_input\":{\"skill\":\"salesforce-development:platform-destructive-deploy\"}}" \
+  | "$CTX" record-skill-dispatch >/dev/null
+check quiet - "Write destructiveChangesPost.xml allowed after platform-destructive-deploy dispatch (delegate)" "$DESTRUCT_S3"
+
 # F1 — CWD drift must not break suppression: record the dispatch, then `cd`
 # elsewhere before the owning skill's own `sf` call. The cwd-independent runtime
 # dir means that call still hits its own marker and is allowed through.

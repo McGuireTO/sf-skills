@@ -5713,6 +5713,34 @@ class PluginInstallTelemetryTests(unittest.TestCase):
         self.assertEqual(sfx._load_plugin_flow(session_id)["state"], "installed")
         self.assertEqual(self._recorded[-1][2]["tool_input"]["reason"], "installed")
 
+    def test_claude_confirm_with_valid_nonce_alone_installs(self):
+        # Claude's own Bash permission prompt is the consent step, so a valid
+        # nonce installs without a pending preview in the same session.
+        name = "experience-react"
+        entry = {"source": "./plugins/builder/experience-react", "origin": "local"}
+        nonce = sfx._plugin_install_nonce(name, entry)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SF_AGENT_CLIENT", "CLAUDE_CODE_SESSION_ID")}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(
+                    sfx, "_plugin_install_lookup", return_value=_plugin_lookup(entry)), \
+                mock.patch.object(sfx, "_ensure_salesforce_marketplace_registered"), \
+                mock.patch.object(
+                    sfx, "_run_plugin_install_step",
+                    return_value=(True, {"exitCode": 0}),
+                ) as step, \
+                mock.patch.object(sfx, "_plugin_install_fire_installed"), \
+                mock.patch.object(sfx, "_plugin_install_fire_loaded"), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                sfx.cmd_plugin_install(
+                    [name, "--confirm", nonce, "--session-id", "sess-no-preview"]
+                ),
+                0,
+            )
+            self.assertTrue(step.called)
+            self.assertEqual(sfx.cmd_plugin_install([name, "--confirm", nonce]), 0)
+
     def test_accepted_same_marketplace_proposal_installs_in_one_call(self):
         name = "experience-react"
         session_id = "sess-trusted-accept"
@@ -5829,6 +5857,7 @@ class PluginInstallTelemetryTests(unittest.TestCase):
             session_id, [name], selected=name, state="awaiting-confirmation",
             surface="session-start", task_backed=False,
         ))
+        self.assertTrue(sfx._save_plugin_install_pending(session_id, name, nonce))
         with mock.patch.object(
                 sfx, "_plugin_install_lookup", return_value=_plugin_lookup(entry)), \
                 mock.patch.object(sfx, "_ensure_salesforce_marketplace_registered"), \
@@ -7357,7 +7386,7 @@ class DriveMarkerTests(unittest.TestCase):
 
 
 class PromptSurfaceActivationAndWidthTests(unittest.TestCase):
-    """Track A A1+A3: the prompt-time plugin surfaces hedge on activation
+    """Simple Changes: prompt-time plugin surfaces hedge on activation
     (enabled-on-disk is NOT active-in-session -> /reload-plugins) and never emit a
     visible line wider than the 80-cell frame, even at the schema's 64-char name
     ceiling."""
@@ -7366,7 +7395,7 @@ class PromptSurfaceActivationAndWidthTests(unittest.TestCase):
         return [line for line in visible.split("\n")
                 if sfx._terminal_cell_width(line) > 80]
 
-    # --- A1: activation truthfulness --------------------------------------
+    # --- Activation truthfulness ------------------------------------------
     def test_resume_surface_hedges_on_reload(self):
         model, visible = sfx._prompt_test_drive_resume_surface("service-help-agent")
         self.assertIn("/reload-plugins", visible)
@@ -7374,7 +7403,7 @@ class PromptSurfaceActivationAndWidthTests(unittest.TestCase):
         # The command still points the user at their next step, intact.
         self.assertIn("/salesforce-test-drive:start service-help-agent", visible)
 
-    # --- A3: <=80-cell frame at the schema boundary -----------------------
+    # --- <=80-cell frame at the schema boundary ---------------------------
     def test_recommendation_bullet_fits_frame_at_64_char_name(self):
         name = "a" * 64
         _note, visible = sfx._prompt_plugin_recommendation_surface(
@@ -8045,6 +8074,79 @@ class SessionScopedSkillsFirstTests(unittest.TestCase):
         self.load_skill("platform-data-manage", prompt="p1")
         self.assertEqual(self.gate(self.QUERY, prompt="p2"), "allow")
 
+    DESTRUCTIVE_MANIFESTS = ("manifest/destructiveChangesPre.xml",
+                             "manifest/destructiveChangesPost.xml")
+    MANIFEST_BODY = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<Package xmlns="http://soap.sforce.com/2006/04/metadata">'
+                     '<version>60.0</version></Package>')
+
+    def write_gate(self, file_path, session="s1", prompt="p1", **extra):
+        payload = {"tool_name": "Write",
+                   "tool_input": {"file_path": file_path, "content": self.MANIFEST_BODY},
+                   "session_id": session, "prompt_id": prompt, **extra}
+        result = self._run(sfx.cmd_skills_first_advisory, payload)
+        return result.get("hookSpecificOutput") or {}
+
+    def test_destructive_deploy_dispatch_allows_its_manifest_write_this_prompt(self):
+        # forcedotcom/sf-skills#359: platform-destructive-deploy Step 1c writes its own
+        # destructiveChangesPre/Post.xml, so its dispatch satisfies the manifest deny.
+        self._run(sfx.cmd_record_skill_dispatch, {
+            "session_id": "s1", "prompt_id": "p1",
+            "tool_input": {"skill": "salesforce-development:platform-destructive-deploy"}})
+        for path in self.DESTRUCTIVE_MANIFESTS:
+            with self.subTest(path=path):
+                self.assertIsNone(self.write_gate(path).get("permissionDecision"))
+
+    def test_destructive_deploy_dispatch_persists_for_the_session(self):
+        self.load_skill("platform-destructive-deploy", prompt="p1")
+        self.assertTrue((self.session_skills() / "platform-destructive-deploy").exists())
+        for path in self.DESTRUCTIVE_MANIFESTS:
+            with self.subTest(path=path):
+                self.assertIsNone(self.write_gate(path, prompt="p2").get("permissionDecision"))
+
+    def test_destructive_deploy_dispatch_allows_package_xml_write(self):
+        path = "manifest/package.xml"
+        self.assertEqual(self.write_gate(path).get("permissionDecision"), "deny")
+        self.load_skill("platform-destructive-deploy", prompt="p1")
+        for prompt in ("p1", "p2"):
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(self.write_gate(path, prompt=prompt).get("permissionDecision"))
+
+    def test_destructive_deploy_dispatch_allows_raw_manifest_cli(self):
+        command = "sf project generate manifest --source-dir force-app"
+        self.assertEqual(self.gate(command), "deny")
+        self.load_skill("platform-destructive-deploy", prompt="p1")
+        for prompt in ("p1", "p2"):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(self.gate(command, prompt=prompt), "allow")
+
+    def test_destructive_deploy_dispatch_does_not_clear_other_enforced_skills(self):
+        self.load_skill("platform-destructive-deploy", prompt="p1")
+        for command in (self.QUERY, self.RETRIEVE, "sf apex run test"):
+            for prompt in ("p1", "p2"):
+                with self.subTest(command=command, prompt=prompt):
+                    self.assertEqual(self.gate(command, prompt=prompt), "deny")
+
+    def test_destructive_deploy_session_allow_is_not_read_by_subagents_or_bare_names(self):
+        path = self.DESTRUCTIVE_MANIFESTS[0]
+        self.load_skill("platform-destructive-deploy", plugin="", prompt="p1")
+        self.assertFalse(self.session_skills().exists())
+        self.assertEqual(self.write_gate(path, prompt="p2").get("permissionDecision"), "deny")
+        self.load_skill("platform-destructive-deploy", prompt="p1")
+        self.assertEqual(self.write_gate(path, prompt="p2", agent_id="a1")
+                         .get("permissionDecision"), "deny")
+
+    def test_hand_authored_manifest_is_still_denied_without_a_satisfying_dispatch(self):
+        # An unrelated enforced dispatch must not clear the manifest deny.
+        self.load_skill("platform-soql-query", prompt="p1")
+        for path in ("manifest/package.xml", "manifest/destructiveChanges.xml",
+                     *self.DESTRUCTIVE_MANIFESTS):
+            with self.subTest(path=path):
+                out = self.write_gate(path, prompt="p2")
+                self.assertEqual(out.get("permissionDecision"), "deny")
+                self.assertIn("`salesforce-development:platform-manifest-generate`",
+                              out.get("permissionDecisionReason", ""))
+
     def test_different_skill_is_still_denied(self):
         self.load_skill("platform-soql-query", prompt="p1")
         self.assertEqual(self.gate(self.RETRIEVE, prompt="p2"), "deny")
@@ -8139,6 +8241,108 @@ class SessionScopedSkillsFirstTests(unittest.TestCase):
                 self.assertEqual(self.gate(self.QUERY, prompt="p5", **{key: "a1"}), "allow")
                 self.assertEqual(self.gate(self.QUERY, prompt="p6", **{key: "a1"}), "deny")
                 self.assertFalse(self.session_skills().exists())
+
+    ENFORCED_OPS = (
+        ("Bash", {"command": QUERY}, "platform-soql-query"),
+        ("Bash", {"command": RETRIEVE}, "platform-metadata-retrieve"),
+        ("Bash", {"command": "sf apex run test"}, "platform-apex-test-run"),
+        ("Bash", {"command": "sf project generate manifest"}, "platform-manifest-generate"),
+        ("Write", {"file_path": "manifest/package.xml"}, "platform-manifest-generate"),
+    )
+
+    def test_subagent_without_prompt_context_gets_advisory_not_deny(self):
+        # Synthetic host payload: no prompt_id and no current-fallback leaves the
+        # subagent no ledger its dispatch could satisfy (sf-skills#362).
+        for key in ("agent_id", "agentId"):
+            for tool, tool_input, skill in self.ENFORCED_OPS:
+                with self.subTest(agent_key=key, tool_input=tool_input):
+                    self.load_skill(skill, prompt=None, **{key: "a1"})
+                    payload = {"tool_name": tool, "tool_input": tool_input,
+                               "session_id": "s1", key: "a1"}
+                    result = self._run(sfx.cmd_skills_first_advisory, payload)
+                    hook = result.get("hookSpecificOutput") or {}
+                    self.assertNotIn("permissionDecision", hook)
+                    self.assertTrue(result.get("continue"))
+                    self.assertIn(f"salesforce-development:{skill}",
+                                  hook.get("additionalContext", ""))
+
+    def test_subagent_with_fallback_still_requires_its_own_dispatch(self):
+        for key in ("agent_id", "agentId"):
+            for tool, tool_input, skill in self.ENFORCED_OPS:
+                with self.subTest(agent_key=key, tool_input=tool_input):
+                    sfx._prompt_context({"session_id": "s1"}, rotate_fallback=True)
+                    # Parent's session ledger cannot satisfy the subagent.
+                    self.load_skill(skill, prompt="parent")
+                    payload = {"tool_name": tool, "tool_input": tool_input,
+                               "session_id": "s1", key: "a1"}
+                    result = self._run(sfx.cmd_skills_first_advisory, payload)
+                    self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                    self.load_skill(skill, prompt=None, **{key: "a1"})
+                    self.assertEqual(self._run(sfx.cmd_skills_first_advisory, payload),
+                                     {"continue": True})
+
+    def test_subagent_with_missing_or_invalid_session_or_prompt_ids_still_denies(self):
+        for session in (None, "", "../escape"):
+            with self.subTest(session=session):
+                self.assertEqual(self.gate(self.QUERY, session=session,
+                                           prompt=None, agent_id="a1"), "deny")
+        for key in ("prompt_id", "promptId"):
+            for prompt in ("", "../escape", 42):
+                with self.subTest(key=key, prompt=prompt):
+                    self.assertEqual(self.gate(self.QUERY, prompt=None,
+                                               agent_id="a1", **{key: prompt}), "deny")
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink semantics")
+    def test_subagent_with_symlinked_runtime_or_session_still_denies(self):
+        for level in ("runtime", "session"):
+            with self.subTest(level=level):
+                shutil.rmtree(self.runtime, ignore_errors=True)
+                self.assertEqual(self.gate(self.QUERY, agent_id="a1"), "deny")
+                path = self.runtime if level == "runtime" else self.session_skills().parent
+                real = self.root / f"real-{level}"
+                path.rename(real)
+                path.symlink_to(real, target_is_directory=True)
+                for prompt in (None, "p1"):
+                    for tool, tool_input, _ in self.ENFORCED_OPS:
+                        payload = {"tool_name": tool, "tool_input": tool_input,
+                                   "session_id": "s1", "agent_id": "a1", "prompt_id": prompt}
+                        result = self._run(sfx.cmd_skills_first_advisory, payload)
+                        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                path.unlink()
+
+    @unittest.skipUnless(hasattr(os, "getuid"), "POSIX ownership semantics")
+    def test_subagent_with_foreign_runtime_owner_still_denies(self):
+        self.runtime.mkdir(mode=0o700)
+        foreign_uid = os.getuid() + 1
+        with mock.patch.object(sfx.os, "getuid", return_value=foreign_uid):
+            for prompt in (None, "p1"):
+                self.assertEqual(self.gate(self.QUERY, prompt=prompt, agent_id="a1"), "deny")
+
+    def test_subagent_with_corrupt_or_unreadable_fallback_still_denies(self):
+        self.session_skills().parent.mkdir(parents=True, mode=0o700)
+        fallback = self.session_skills().parent / "current-fallback"
+        for text in ("", "../escape", "p1"):
+            with self.subTest(text=text):
+                fallback.write_text(text)
+                self.assertEqual(self.gate(self.QUERY, prompt=None, agent_id="a1"), "deny")
+        fallback.unlink()
+        fallback.mkdir()
+        self.assertEqual(self.gate(self.QUERY, prompt=None, agent_id="a1"), "deny")
+        fallback.rmdir()
+        # An unreadable marker is not the same as an absent marker.
+        original_lstat = Path.lstat
+        def unreadable(path, *args, **kwargs):
+            if path == fallback:
+                raise PermissionError("unreadable fallback")
+            return original_lstat(path, *args, **kwargs)
+        with mock.patch.object(Path, "lstat", unreadable):
+            self.assertEqual(self.gate(self.QUERY, prompt=None, agent_id="a1"), "deny")
+
+    def test_main_session_without_prompt_context_still_enforces(self):
+        # The fail-open is subagent-only: the main session's ledger can still clear it.
+        self.assertEqual(self.gate(self.QUERY, prompt=None), "deny")
+        self.load_skill("platform-soql-query", prompt=None)
+        self.assertEqual(self.gate(self.QUERY, prompt=None), "allow")
 
     def test_session_record_is_written_under_ui_mode_off(self):
         with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_UI_MODE": "off"}):

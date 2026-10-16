@@ -7,6 +7,44 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.5.0] — 2026-10-16
+
+### Added
+
+- Native Codex plugin packaging: a Codex manifest, Codex lifecycle hooks (local-only startup
+  banner, org and production/destructive deploy checks, scaffold checks, edit advice, numeric
+  feedback) and Codex command adapters over the shared workflows. Telemetry from Codex is tagged
+  `harness=codex` and records no skill events. On Codex, a production deploy needs the user's own
+  reply `confirm production deploy to <alias>`, which covers one deploy in that session for ten
+  minutes; inline override markers are ignored there.
+- `SF_PLUGIN_UI_MODE=full|plain|off` selects the presentation mode ahead of the other settings.
+
+### Changed
+
+- `salesforce-development` and every plugin in the Salesforce marketplace now support Codex. All of
+  them can be recommended and installed by `salesforce-development` on Codex, and its generated
+  guidance names Codex workflows instead of Claude slash commands.
+
+### Fixed
+
+- The deploy gate now reads the target org with the same parser as its command check, so a mid-word
+  `#` (such as a URL fragment), a heredoc-fed deploy or a multi-line quoted argument no longer
+  makes it check the default org instead of the named one; a target flag it cannot read (for
+  example `-o "$ORG"`, including inside a line with an unmatched quote) is denied. Every deploy or
+  delete in the command is checked, and a command that spans more than one org is denied. The
+  production override counts only as a leading `CONFIRM_PROD=1` on each deploy command itself or
+  its `--I-CONFIRM-PROD` argument, not in a comment, an `echo` or another command, and the
+  production allow message now says an explicit confirmation was present. The default org honors
+  `SF_TARGET_ORG` / `SFDX_TARGET_ORG`.
+- Dispatching `platform-destructive-deploy` now allows manifest writes and raw manifest CLI
+  generation for the session, unblocking its deletion workflow.
+  ([sf-skills#359](https://github.com/forcedotcom/sf-skills/issues/359), reported by
+  [@vernemi2](https://github.com/vernemi2); W-24512242)
+- Subagents with a valid session but no prompt context now receive a skills-first advisory
+  instead of a blocking denial. Invalid or unsafe context still denies.
+  ([sf-skills#362](https://github.com/forcedotcom/sf-skills/issues/362), reported by
+  [@Josh-Topsis](https://github.com/Josh-Topsis); W-24512250)
+
 ## [2.4.0] — 2026-10-09
 
 ### Added

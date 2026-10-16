@@ -1,0 +1,58 @@
+{
+  "name": "salesforce-development",
+  "version": "2.5.0",
+  "description": "Build Salesforce apps and agents using metadata, Apex, deploy/retrieve, security, reporting, and capability discovery.",
+  "author": {
+    "name": "Salesforce",
+    "url": "https://github.com/forcedotcom"
+  },
+  "homepage": "https://github.com/forcedotcom/sf-skills/tree/main/plugins/builder/salesforce-development",
+  "repository": "https://github.com/forcedotcom/sf-skills.git",
+  "license": "Apache-2.0",
+  "keywords": ["salesforce", "apex", "flow", "soql", "metadata", "deploy"],
+  "skills": "./skills/",
+  "commands": "./codex-commands/",
+  "hooks": "./hooks/codex-hooks.json",
+  "mcpServers": {
+    "salesforce-api-context": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["scripts/codex_mcp_launcher.py", "salesforce-api-context"],
+      "env_vars": ["CODEX_WORKSPACE_ROOT", "SF_TARGET_ORG", "SFDX_TARGET_ORG", "INIT_CWD", "PWD"],
+      "cwd": "."
+    },
+    "salesforce-metadata-experts": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["scripts/codex_mcp_launcher.py", "salesforce-metadata-experts"],
+      "env_vars": ["CODEX_WORKSPACE_ROOT", "SF_TARGET_ORG", "SFDX_TARGET_ORG", "INIT_CWD", "PWD"],
+      "cwd": "."
+    },
+    "salesforce-lsp": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["scripts/codex_mcp_launcher.py", "salesforce-lsp"],
+      "env_vars": ["CODEX_WORKSPACE_ROOT", "SF_TARGET_ORG", "SFDX_TARGET_ORG", "INIT_CWD", "PWD"],
+      "cwd": "."
+    }
+  },
+  "interface": {
+    "displayName": "Salesforce Development",
+    "shortDescription": "Build, test, and deploy Salesforce applications",
+    "longDescription": "Salesforce development workflows for project setup, metadata, Apex, Flow, SOQL, security, testing, deployment, reporting, and code analysis.",
+    "developerName": "Salesforce",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Salesforce development",
+      "Code generation",
+      "Testing",
+      "Deployment"
+    ],
+    "websiteURL": "https://github.com/forcedotcom/sf-skills",
+    "defaultPrompt": [
+      "Create an Apex service and its test class.",
+      "Generate Salesforce metadata for this feature.",
+      "Validate and deploy the current Salesforce changes."
+    ]
+  }
+}

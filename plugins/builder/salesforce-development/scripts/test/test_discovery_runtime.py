@@ -3151,6 +3151,10 @@ class GettingStartedWelcomeTests(unittest.TestCase):
                 self.assertEqual(result, {"continue": True})
 
     def test_tripped_out_of_project_orientation_ask_paints_the_nudge(self):
+        # The newcomer auth store stays isolated when the hook clears its environment.
+        home_patch = mock.patch.object(Path, "home", return_value=Path(self.tmp.name))
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
         # The other half of the Side A guard: once the plugin has been tripped this
         # session (welcomed), an orientation question DOES paint the Tier-1 position
         # nudge — the same discipline as the overview ask. The nudge rides the visible

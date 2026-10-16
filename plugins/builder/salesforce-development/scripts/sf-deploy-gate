@@ -11,6 +11,12 @@
 #   bucket <org> - Print the bucket for an org alias, username, or org ID, resolved the
 #                  same way the hooks do (org list record, else org display). Skills
 #                  call this rather than piping `sf org display` into `classify`.
+#   Options for prod-check/destructive (the Codex shell hook passes the command it
+#   already parsed, so the hook and the gate never classify a command differently):
+#     --matched        the caller already matched the command; skip the self-gate
+#     --target <org>   the target org the caller resolved
+#     --client codex   ignore inline confirmation markers; honor only --confirmed
+#     --confirmed      the user's own confirmation for this org was recorded
 #   classify     - Read an `sf org list` record or `sf org display --json` output (both as
 #                  {"result": {...}}) on stdin and print the org bucket
 #                  (production|sandbox|scratch|trial|unknown). Pure function, no
@@ -306,18 +312,76 @@ sf_cli() {
   esac
 }
 
-# Resolve target-org from CLI command args first, fall back to config.
+# Resolve target-org from the command, using the same lexer settings as
+# command_matches (no '#' comments, heredoc bodies scanned). Prints the target org,
+# an empty line for "the default org", UNRESOLVED_TARGET when a target flag is
+# present but cannot be read, or MULTIPLE_TARGETS when the matching calls name
+# different orgs. Both sentinels deny. $1 is the gate mode.
+UNRESOLVED_TARGET="__sf_gate_unresolved__"
+MULTIPLE_TARGETS="__sf_gate_multiple__"
 extract_target_org_from_command() {
   python3 -c "
 import json, re, sys
+unresolved, multiple = sys.argv[3], sys.argv[5]
 try:
-    data = json.loads(sys.argv[1])
-    cmd = data.get('tool_input', {}).get('command', '')
-    m = re.search(r'--target-org[= ]([\\S]+)', cmd) or re.search(r'-o[= ]([\\S]+)', cmd)
-    print(m.group(1) if m else '')
+    cmd = json.loads(sys.argv[1]).get('tool_input', {}).get('command', '') or ''
+    sys.path.insert(0, sys.argv[2])
+    from sf_shim import mutation_verb, scan_sf, target_orgs
+    wanted = ('delete',) if sys.argv[4] == 'destructive' else ('deploy-start', 'deploy-quick')
+    scan = scan_sf(cmd, heredoc_bodies='scan')
+    calls = ([c for c in scan.calls if mutation_verb(c.argv) in wanted]
+             or [c for c in scan.calls if mutation_verb(c.argv)])
+    if calls:
+        # Every matching call is checked; '' stands for the default org.
+        orgs, readable = [], True
+        for call in calls:
+            targets, ambiguous = target_orgs(call.argv)
+            if len(targets) > 1:
+                print(unresolved); sys.exit(0)
+            if ambiguous:
+                readable = False
+                continue
+            orgs.append(targets[0] if targets else '')
+        if not readable:
+            # A target flag whose value cannot be read (a shell expansion, an unmatched
+            # quote, or no value) is denied rather than guessed from the raw text,
+            # even when the rest of the line did not parse.
+            print(unresolved); sys.exit(0)
+        orgs = list(dict.fromkeys(orgs))
+        if len(orgs) > 1:
+            print(multiple); sys.exit(0)
+        if scan.unparsed:
+            # The line could not be lexed, so the raw text may hold a decoy target.
+            print(unresolved); sys.exit(0)
+        print(orgs[0]); sys.exit(0)
+    # No parsed call: the raw-text form.
+    m = (re.search(r'(?:^|\\s)--target-org[= ](\\S+)', cmd)
+         or re.search(r'(?:^|\\s)-o[= ](\\S+)', cmd))
+    if m:
+        print(m.group(1)); sys.exit(0)
+    flag = re.search(r'--target-?org|--targetusername|(?:^|\\s)-[ou]', cmd)
+    print(unresolved if flag else '')
 except Exception:
-    pass
-" "$INPUT" 2>/dev/null
+    print(unresolved)
+" "$INPUT" "$SCRIPT_DIR" "$UNRESOLVED_TARGET" "$1" "$MULTIPLE_TARGETS" 2>/dev/null || echo "$UNRESOLVED_TARGET"
+}
+
+# Claude only: true when every deploy call carries the override itself, as a leading
+# CONFIRM_PROD=1 assignment or a --I-CONFIRM-PROD argument. Comments, echo text and
+# other commands in the same line do not count.
+inline_confirmation() {
+  python3 -c "
+import json, sys
+try:
+    cmd = json.loads(sys.argv[1]).get('tool_input', {}).get('command', '') or ''
+    sys.path.insert(0, sys.argv[2])
+    from sf_shim import inline_prod_confirmation, mutation_verb, scan_sf
+    calls = [c for c in scan_sf(cmd, heredoc_bodies='scan').calls
+             if mutation_verb(c.argv) in ('deploy-start', 'deploy-quick')]
+    print('true' if calls and all(inline_prod_confirmation(c) for c in calls) else 'false')
+except Exception:
+    print('false')
+" "$INPUT" "$SCRIPT_DIR" 2>/dev/null
 }
 
 # Extract the edited/written file path from a PostToolUse Edit/Write/MultiEdit
@@ -335,6 +399,10 @@ except Exception:
 }
 
 get_default_org() {
+  if [ -n "${SF_TARGET_ORG:-${SFDX_TARGET_ORG:-}}" ]; then
+    printf '%s\n' "${SF_TARGET_ORG:-${SFDX_TARGET_ORG:-}}"
+    return
+  fi
   sf_cli config get target-org --json 2>/dev/null | python3 -c "
 import json, sys
 try:
@@ -409,12 +477,16 @@ print(json.dumps({
 # Allow the action, surfacing the classification decision so the org bucket is
 # visible to the developer (issue #259 acceptance: "state the classification aloud").
 allow() {
-  local note="${1:-}"
+  local note="${1:-}" spent="${2:-}"
   if [ -n "$note" ]; then
     python3 -c "
 import json, sys
-print(json.dumps({'continue': True, 'systemMessage': sys.argv[1] + ' ' + sys.argv[2]}))
-" "$GATE_TAG" "$note"
+out = {'continue': True, 'systemMessage': sys.argv[1] + ' ' + sys.argv[2]}
+if sys.argv[3]:
+    # Structured signal for the Codex adapter: this allow relied on a production confirmation.
+    out['prodConfirmationUsed'] = True
+print(json.dumps(out))
+" "$GATE_TAG" "$note" "$spent"
   else
     echo '{"continue": true}'
   fi
@@ -429,6 +501,29 @@ if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
 fi
 
 COMMAND="${1:-prod-check}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MATCHED=false
+CLIENT=claude
+CONFIRMED=false
+TARGET_SET=false
+TARGET_ARG=""
+BAD_OPTION=""
+if [ "$COMMAND" = "prod-check" ] || [ "$COMMAND" = "destructive" ]; then
+  [ "$#" -gt 0 ] && shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --matched) MATCHED=true ;;
+      --confirmed) CONFIRMED=true ;;
+      --target) TARGET_SET=true; TARGET_ARG="${2:-}"; [ "$#" -gt 1 ] && shift ;;
+      --client)
+        CLIENT="${2:-}"; [ "$#" -gt 1 ] && shift
+        case "$CLIENT" in claude|codex) ;; *) BAD_OPTION="--client ${CLIENT}" ;; esac
+        ;;
+      *) BAD_OPTION="$1" ;;
+    esac
+    shift
+  done
+fi
 
 # Preflight: org classification and JSON I/O below all shell out to python3.
 # If it's missing, fail open rather than let every "python3 -c" call below
@@ -436,6 +531,12 @@ COMMAND="${1:-prod-check}"
 # -> allow" behavior (see classify_org_json), just triggered by a missing
 # interpreter instead of missing org data.
 if ! command -v python3 &> /dev/null; then
+  if [ "$MATCHED" = "true" ] || [ "$CLIENT" = "codex" ] || [ -n "$BAD_OPTION" ]; then
+    # A caller that already classified the command as a mutation gets a decision.
+    echo "sf-deploy-gate: python3 not found on PATH — denying the matched command" >&2
+    echo '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "'"$GATE_TAG"' python3 not found — the target org cannot be classified, so this deploy/delete is blocked."}}'
+    exit 0
+  fi
   echo "sf-deploy-gate: python3 not found on PATH — skipping org classification, failing open (see README Requirements)" >&2
   if [ "$COMMAND" = "classify" ] || [ "$COMMAND" = "bucket" ]; then
     echo "unknown"
@@ -451,6 +552,29 @@ fi
 if [ "$COMMAND" != "classify" ] && [ "$COMMAND" != "bucket" ]; then
   INPUT=$(cat 2>/dev/null || echo '{}')
 fi
+
+if [ -n "$BAD_OPTION" ]; then
+  deny "Unknown gate option '${BAD_OPTION}'; refusing to evaluate this command."
+fi
+
+# Resolve the target org for a prod-check/destructive mode: the caller's --target,
+# else the command's own flag, else the default org.
+resolve_target_org() {
+  if [ "$TARGET_SET" = "true" ]; then
+    TARGET_ORG="$TARGET_ARG"
+  else
+    TARGET_ORG=$(extract_target_org_from_command "$COMMAND")
+    if [ -z "$TARGET_ORG" ]; then
+      TARGET_ORG=$(get_default_org)
+    fi
+  fi
+  if [ "$TARGET_ORG" = "$UNRESOLVED_TARGET" ]; then
+    deny "The target org of this command could not be read. Pass one literal --target-org <alias>."
+  fi
+  if [ "$TARGET_ORG" = "$MULTIPLE_TARGETS" ]; then
+    deny "This command deploys or deletes in more than one org. Run one command per org so each target org is checked."
+  fi
+}
 
 case "$COMMAND" in
   classify)
@@ -471,11 +595,10 @@ case "$COMMAND" in
     # matching the plugin.json `if:` scope. A check-only `sf project deploy validate`
     # is safe against prod and must NOT be denied here. Whitespace-flexible so
     # `sf  project  deploy start` can't slip the gate (see command_matches).
-    [ "$(command_matches 'sf project deploy start|quick')" = "true" ] || allow
-    TARGET_ORG=$(extract_target_org_from_command)
-    if [ -z "$TARGET_ORG" ]; then
-      TARGET_ORG=$(get_default_org)
+    if [ "$MATCHED" != "true" ]; then
+      [ "$(command_matches 'sf project deploy start|quick')" = "true" ] || allow
     fi
+    resolve_target_org
 
     if [ -z "$TARGET_ORG" ]; then
       deny "No target org configured. Run 'sf config set target-org <alias>' before deploying."
@@ -491,22 +614,24 @@ case "$COMMAND" in
       deny "BLOCKED: destructive deploy (destructiveChanges manifest) against Production org '${TARGET_ORG}'. This DELETES metadata and has the same blast radius as 'sf project delete'. Use 'platform-destructive-deploy' skill which validates first and requires explicit confirmation."
     fi
 
-    # Detect explicit-confirmation flags the user may have set in the command itself.
-    HAS_CONFIRMATION=$(python3 -c "
-import json, sys
-try:
-    data = json.loads(sys.argv[1])
-    cmd = data.get('tool_input', {}).get('command', '')
-    print('true' if any(t in cmd for t in ['--I-CONFIRM-PROD', 'CONFIRM_PROD=1']) else 'false')
-except Exception:
-    print('false')
-" "$INPUT" 2>/dev/null)
+    if [ "$CLIENT" = "codex" ]; then
+      HAS_CONFIRMATION="$CONFIRMED"
+    else
+      HAS_CONFIRMATION=$(inline_confirmation)
+    fi
 
     if [ "$BUCKET" = "production" ] && [ "$HAS_CONFIRMATION" != "true" ]; then
+      if [ "$CLIENT" = "codex" ]; then
+        deny "BLOCKED: target org '${TARGET_ORG}' appears to be a Production org. Production deploys must be explicitly confirmed by the developer. Do not change the command to get past this check. Ask the user to reply with exactly: confirm production deploy to ${TARGET_ORG} — then rerun the same command unchanged. Recommended workflow: validate first with the 'platform-deploy-validate' skill (returns a 10-day job ID), then deploy with the 'platform-quick-deploy' skill."
+      fi
       deny "BLOCKED: target org '${TARGET_ORG}' appears to be a Production org. Production deploys must be explicitly confirmed by the developer. Recommended workflow:
 1. Use 'platform-deploy-validate' skill to validate (returns a 10-day job ID)
 2. Use 'platform-quick-deploy' skill which gates with explicit user confirmation
 Or, to override this hook, prepend 'CONFIRM_PROD=1' to your command (NOT recommended)."
+    fi
+
+    if [ "$BUCKET" = "production" ]; then
+      allow "Deploy gate: target org '${TARGET_ORG}' classified as production — explicit confirmation present, allowing deploy." "$([ "$CLIENT" = "codex" ] && echo spent)"
     fi
 
     # Non-prod destructive deploys are advised, not blocked (parity with the
@@ -521,9 +646,10 @@ Or, to override this hook, prepend 'CONFIRM_PROD=1' to your command (NOT recomme
   destructive)
     # Self-gate: only gate an actual delete (any `sf project delete` form, matching
     # the plugin.json `if:` scope). Whitespace-flexible (see command_matches).
-    [ "$(command_matches 'sf project delete')" = "true" ] || allow
-    TARGET_ORG=$(extract_target_org_from_command)
-    [ -z "$TARGET_ORG" ] && TARGET_ORG=$(get_default_org)
+    if [ "$MATCHED" != "true" ]; then
+      [ "$(command_matches 'sf project delete')" = "true" ] || allow
+    fi
+    resolve_target_org
 
     if [ -z "$TARGET_ORG" ]; then
       deny "No target org configured."

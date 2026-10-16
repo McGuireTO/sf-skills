@@ -257,11 +257,9 @@ def _serialized(data: dict) -> str:
 def generate(repo_root: Path, plugin_root: Path, artifact: Optional[Path] = None) -> Path:
     destination = artifact or plugin_root / ARTIFACT_RELATIVE
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        _serialized(build_catalog(repo_root, plugin_root)),
-        encoding="utf-8",
-        newline="\n",
-    )
+    # open() rather than Path.write_text(newline=...), which needs Python 3.10.
+    with open(destination, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(_serialized(build_catalog(repo_root, plugin_root)))
     return destination
 
 

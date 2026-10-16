@@ -368,9 +368,9 @@ else:
 }
 
 BYPASS_CMD="sf project deploy start --source-dir force-app"
-capture_prompt "$SID_DECLINE" "p1" "$MEDIUM_PROMPT"
+SF_PLUGIN_MATCH_SENSITIVITY=high capture_prompt "$SID_DECLINE" "p1" "$MEDIUM_PROMPT"
 BYPASS_PAYLOAD="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$BYPASS_CMD\"},\"session_id\":\"$SID_DECLINE\",\"prompt_id\":\"p1\"}"
-GOT_AFTER_DECLINE=$(printf '%s' "$BYPASS_PAYLOAD" | "$CTX" skills-first-advisory | parse_decision)
+GOT_AFTER_DECLINE=$(printf '%s' "$BYPASS_PAYLOAD" | SF_PLUGIN_MATCH_SENSITIVITY=high "$CTX" skills-first-advisory | parse_decision)
 if [ "$GOT_AFTER_DECLINE" = "warn" ]; then
   PASS=$((PASS + 1)); printf '  ok   %-60s → %s\n' "a later bypass-gate hit after decline warns (not denies)" "$GOT_AFTER_DECLINE"
 else

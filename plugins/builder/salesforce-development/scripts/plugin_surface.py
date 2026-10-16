@@ -1,43 +1,8 @@
 #!/usr/bin/env python3
-"""Pure, stdlib-only bounded-bullet rendering used by the discovery surfaces.
+"""Stdlib-only rendering for discovery bullets bounded to 80 terminal cells.
 
-Why this module exists
-----------------------
-The discovery surfaces paint plugin recommendation / pointer bullets that must
-never exceed the plugin's self-imposed 80-terminal-cell frame. This module is
-the single rendering policy for those bullets: ``sf_context.py`` imports
-``fit_bullet_line`` for the prompt, welcome, and SessionStart recommendation
-surfaces so the width math lives in one place instead of being kept "in sync by
-hand" across call sites -- which had drifted: a ``max(28, ...)`` blurb floor that
-overflowed the frame on long plugin names, and command lines with no width
-budget at all (remediation plan A3).
-
-Historically a second runtime -- the standalone ``session_plugin_hint.py``
-SessionStart hook -- also painted these bullets and deliberately did NOT import
-the ~11k-line ``sf_context.py`` (fast session start), which is why the shared
-policy was extracted into a small stdlib-only module. That hook has since been
-folded into ``sf_context`` (the SessionStart banner emits the recommendation
-in-process, in ``_session_start_plugin_slot``), so ``sf_context`` is now the
-only importer. The module is kept separate to avoid churning a large in-flight
-file and because its cell-measurement copy is independently parity-tested.
-
-The duplication decision (Track A, 2026-08-30)
-----------------------------------------------
-A3 prefers *extracting* the width primitives so there is one physical source of
-truth. In this tree the leaf ``_ansi_sequence_end`` is shared between
-``sf_context._sanitize_dynamic_text`` and its grapheme stack, so physically
-moving the primitives out would entangle the sanitizer and churn a large file
-that already carries in-flight work. Per the plan's sanctioned fallback
-("duplicate only the minimal adapter and add parity tests"), this module carries
-a self-contained COPY of the conservative cell-measurement approximation, and
-``test_plugin_surface.py`` asserts parity with ``sf_context._terminal_cell_width``
-/ ``_clip_cells`` / ``_wrap_cells`` over a Unicode fixture set. If they ever
-diverge, that test fails. The copied logic is intentionally identical to
-sf_context's; keep them in step (or, in Track B, collapse both onto this module).
-
-This module sanitizes NOTHING. Callers pass already-sanitized text -- every
-sf_context surface runs dynamic values through ``_sanitize_dynamic_text`` before
-rendering. This module only measures, clips, wraps, and fits.
+Callers supply sanitized text. This module measures, clips, wraps and fits it.
+Unicode width primitives match sf_context's independently parity-tested copies.
 """
 from __future__ import annotations
 

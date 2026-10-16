@@ -35,7 +35,15 @@ case "$*" in
     printf '{"result":[{"name":"target-org","value":"%s"}]}' "${STUB_DEFAULT_ORG:-stuborg}"
     ;;
   "org display --target-org "*" --json"|"org display "*"--json")
-    color "${STUB_ORG_JSON:-{\}}"
+    # STUB_PROD_ALIAS classifies per alias: that alias is production, any other is a sandbox.
+    if [ -n "${STUB_PROD_ALIAS:-}" ]; then
+      case " $* " in
+        *" ${STUB_PROD_ALIAS} "*) color '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://acme.my.salesforce.com"}}' ;;
+        *) color '{"result":{"isSandbox":true,"instanceUrl":"https://acme--dev.sandbox.my.salesforce.com"}}' ;;
+      esac
+    else
+      color "${STUB_ORG_JSON:-{\}}"
+    fi
     ;;
   *) printf '{}' ;;
 esac
@@ -339,6 +347,97 @@ unset STUB_ORG_LIST_JSON
 FORCE_COLOR=3 decision deny "#349 FORCE_COLOR=3 prod (org display) → deny" \
   "sf project deploy start --target-org prod" \
   '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://acme.my.salesforce.com"}}'
+
+# --- Per-alias classification: production is `prod`, the default org is a sandbox ---
+# The gate must check the org the command names, never fall back to the default org.
+export STUB_PROD_ALIAS=prod STUB_DEFAULT_ORG=dev
+decision deny "per-alias: '#' URL then deploy to prod → deny" \
+  "curl https://x/a#b && sf project deploy start --target-org prod" '{}'
+decision deny "per-alias: bash heredoc deploy to prod → deny" \
+  "bash <<EOF\nsf project deploy start --target-org prod\nEOF" '{}'
+decision deny "per-alias: multi-line --message, prod → deny" \
+  'sf project deploy start --message \"line one\nline two\" --target-org prod' '{}'
+decision deny "per-alias: attached -oprod → deny" \
+  "sf project deploy start -oprod" '{}'
+decision deny "per-alias: unreadable target flag → deny" \
+  "sf project deploy start --target-org" '{}'
+decision deny "per-alias: shell-expanded -o target → deny" \
+  'sf project deploy start -o \"$ORG\"' '{}'
+decision deny "per-alias: shell-expanded --target-org → deny" \
+  'sf project deploy start --target-org \"$ORG\" --source-dir force-app' '{}'
+decision deny "per-alias: unmatched quote around an expanded target → deny" \
+  'sf project deploy start --target-org=\"$ORG' '{}'
+decision deny "per-alias: unlexable line with a decoy -o → deny" \
+  "echo \$'it\\\\'s' -o dev ; sf project deploy start -o prod" '{}'
+decision deny "per-alias: quoted ; argument cannot hide the prod target → deny" \
+  'sf project deploy start --source-dir \";\" -o prod' '{}'
+decision deny "per-alias: escaped backslash does not hide a second prod deploy → deny" \
+  'sf project deploy start -o dev \\\\; sf project deploy start -o prod' '{}'
+decision allow "per-alias: explicit sandbox target → allow" \
+  "sf project deploy start --target-org dev" '{}'
+decision allow "per-alias: default sandbox org → allow" \
+  "sf project deploy start --source-dir force-app" '{}'
+
+# The override counts only on the deploy command itself.
+decision deny "confirm marker in a comment → deny" \
+  "sf project deploy start --target-org prod # CONFIRM_PROD=1" '{}'
+decision deny "confirm marker in another command → deny" \
+  "echo CONFIRM_PROD=1; sf project deploy start --target-org prod" '{}'
+decision allow "leading CONFIRM_PROD=1 on the deploy → allow" \
+  "CONFIRM_PROD=1 sf project deploy start --target-org prod" '{}'
+decision allow "--I-CONFIRM-PROD on the deploy → allow" \
+  "sf project deploy start --I-CONFIRM-PROD --target-org prod" '{}'
+
+# gate_text <want-regex> <reject-regex|-> <desc> <command> <gate args...>
+gate_text() {
+  local want="$1" reject="$2" desc="$3" cmd="$4" out
+  shift 4
+  out=$(printf '{"tool_input":{"command":"%s"}}' "$cmd" | "$GATE" "$@")
+  if printf '%s' "$out" | grep -Eq -- "$want" && { [ "$reject" = "-" ] || ! printf '%s' "$out" | grep -Eq -- "$reject"; }; then
+    PASS=$((PASS + 1)); printf '  ok   %-46s\n' "$desc"
+  else
+    FAIL=$((FAIL + 1)); printf '  FAIL %-46s raw: %s\n' "$desc" "$out"
+  fi
+}
+gate_text 'explicit confirmation present, allowing deploy' - "confirmed prod allow message" \
+  "CONFIRM_PROD=1 sf project deploy start --target-org prod" prod-check
+
+# The Codex hook passes the command it parsed; inline markers never confirm on Codex.
+gate_text '"deny"' 'CONFIRM_PROD' "codex: inline marker ignored → deny" \
+  "CONFIRM_PROD=1 sf project deploy start -o prod" prod-check --matched --target prod --client codex
+gate_text 'confirm production deploy to prod' - "codex: deny asks for the confirmation phrase" \
+  "sf project deploy start -o prod" prod-check --matched --target prod --client codex
+gate_text 'explicit confirmation present' - "codex: --confirmed prod → allow" \
+  "sf project deploy start -o prod" prod-check --matched --target prod --client codex --confirmed
+gate_text 'classified as sandbox' - "codex: sandbox target → allow with a message" \
+  "! sf project deploy start -o dev" prod-check --matched --target dev --client codex
+gate_text '"deny"' - "codex: --matched skips the self-gate" \
+  "! sf project deploy start -o prod" prod-check --matched --target prod --client codex
+gate_text '"deny"' - "codex: destructive prod → deny" \
+  "! sf project delete source -o prod" destructive --matched --target prod --client codex
+gate_text '"deny"' - "codex: empty --target → deny" \
+  "sf project deploy start" prod-check --matched --target "" --client codex
+gate_text '"deny"' - "unknown gate option → deny" \
+  "sf project deploy start -o dev" prod-check --bogus
+
+# Every deploy or delete call in the command is checked, not only the first.
+decision deny "default-org deploy then prod deploy → deny" \
+  "sf project deploy start --source-dir a && sf project deploy start --source-dir b -o prod" '{}'
+decision deny "sandbox deploy then prod deploy → deny" \
+  "sf project deploy start -o dev; sf project deploy start --target-org prod" '{}'
+decision deny "prod deploy then sandbox deploy → deny" \
+  "sf project deploy start -o prod; sf project deploy start -o dev" '{}'
+decision deny "override on only one of two prod deploys → deny" \
+  "CONFIRM_PROD=1 sf project deploy start -o prod; sf project deploy start -o prod" '{}'
+decision allow "two deploys to the same sandbox → allow" \
+  "sf project deploy start -o dev --source-dir a && sf project deploy start -o dev --source-dir b" '{}'
+decision allow "override on both prod deploys → allow" \
+  "CONFIRM_PROD=1 sf project deploy start -o prod && CONFIRM_PROD=1 sf project deploy start -o prod" '{}'
+gate_text 'more than one org' - "multi-org deploy names the reason" \
+  "sf project deploy start -o dev; sf project deploy start -o prod" prod-check
+gate_text '"deny"' - "destructive: sandbox delete then prod delete → deny" \
+  "sf project delete source -m ApexClass:A -o dev; sf project delete source -m ApexClass:B -o prod" destructive
+unset STUB_PROD_ALIAS STUB_DEFAULT_ORG
 
 # --- #349: the gate must never run a bare `sf org list` (per-org token refresh) ---
 if [ -e "$STUB_DIR/bare-org-list" ]; then

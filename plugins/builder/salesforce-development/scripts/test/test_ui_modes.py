@@ -616,11 +616,13 @@ class NaturalLanguagePaintUiModes(unittest.TestCase):
 
     def test_plain_journey_paint_outside_a_project_names_no_project(self):
         # Unmocked state: the project line comes from the derived journey context,
-        # not project_meta()'s "Project" placeholder.
+        # not project_meta()'s "Project" placeholder. Isolate the user's global
+        # target-org setting so this checks the empty temporary directory alone.
         sid = "plain-journey-outside"
         os.chdir(self.outside)
         self._prompt_seq += 1
-        result, _ = self.journey_hook("plain", session_id=sid, real_state=True)
+        with mock.patch.object(SFX, "_configured_target_alias", return_value=None):
+            result, _ = self.journey_hook("plain", session_id=sid, real_state=True)
         visible = result["systemMessage"]
         self.assertIn("Project: no project", visible)
         self.assertIn("Current stage: none yet", visible)

@@ -72,6 +72,33 @@ pauses, an API-gap log, and an error catalog — used to measure friction and fi
 Instrumentation is off by default; a normal run is clean. See
 [`references/instrumentation.md`](references/instrumentation.md).
 
+## Codex (limited support)
+
+Claude Code is the supported host. A native Codex adapter (`.codex-plugin/plugin.json`,
+`codex-commands/start.md`, [`references/codex-host.md`](references/codex-host.md)) runs the same
+engine with Codex-specific mechanics. It is not yet exercised in a live Codex session. It needs a
+Codex-enabled `salesforce-development` (one with `.codex-plugin/plugin.json`) and a new Codex
+session after any install. Codex has no `/salesforce-test-drive:start` slash command; ask it to start a Salesforce Test Drive (needs a Codex build with command migration, 0.145.0 or later). Because this plugin ships a Codex manifest, Salesforce Development can
+recommend and install it through its guarded flow; installation is not proof of live workflow
+verification.
+
+| Flow | Codex |
+|---|---|
+| Catalog menu, direct launch, companion check, toolchain preflight, org detection, requirements gate | Adapter provided; not live-exercised |
+| Required builder plugins | Installed one at a time through the guarded Salesforce Development flow, then used in a new Codex session |
+| Resume marker (`test-drive-mark`) | Shared per project across hosts; the companion words the resume nudge for the active host |
+| `--instrument` | Unchanged; counts come from the model's own record |
+| Composite workflows | Recommendation and installation do not prove that every cross-plugin workflow is verified end to end |
+
+When a drive requires `agentforce-adlc`, `experience-cms`, or `service-engagement`, Codex uses the
+same guarded recommendation and installation flow as every other builder plugin. Installation still
+requires explicit consent and a new Codex session; it is not evidence that an unverified composite
+workflow is supported.
+
+A deploy to a connected org is a normal build step. A production deploy additionally needs your own
+`confirm production deploy to <alias>` reply; that gate is enforced by the Salesforce Development
+Codex hooks, so it applies when those hooks are trusted and enabled.
+
 ## Verify, Update, and Uninstall
 
 - **Verify:** `/plugin` lists `salesforce-test-drive`; `/salesforce-test-drive:start` opens the menu.

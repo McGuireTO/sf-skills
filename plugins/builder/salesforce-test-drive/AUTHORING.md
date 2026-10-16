@@ -49,8 +49,8 @@ with `/salesforce-test-drive:start <id>` (see **Command surface** below).
    (`any` / `developer-edition` / `agentforce`). **Don't put signup URLs in your entry:** routing is
    centralized in the engine against this closed enum precisely so no unverified deep-link can ship. If
    your drive needs a trial edition/template the engine doesn't route to yet, raise it with the framework
-   team rather than pasting a link. List `orderedSkills` (the `salesforce-development` skills your drive
-   choreographs) — advisory, but it documents intent.
+   team rather than pasting a link. List `orderedSkills` (the skills your drive choreographs). They document intent, and on Codex
+   the skills owned by `agentforce-adlc` are gated and installed from this list (see **Codex**).
 5. That's it — **no command to add.** The drive appears in the `/salesforce-test-drive:start` menu
    automatically (the menu is built from the catalog) and is launchable directly with
    `/salesforce-test-drive:start <id>`. See **Command surface**.
@@ -115,4 +115,13 @@ prompt.
 Today: your catalog entry is checked against `catalog/test-drive.schema.json` (strict — a typo'd field
 fails). Value-level checks a schema can't express — the `promptPath` file exists, `orderedSkills` name
 real skills, the owner contact is reachable — are intended for a future imperative lint gate (a
-follow-up, modeled on the repo's `validate-eval-domains.ts`). Until then, verify those by hand.
+follow-up, modeled on the repo's `validate-eval-domains.ts`). Until then, verify those by hand;
+`scripts/test/test_codex_compatibility.py` already checks that each `promptPath` exists.
+
+## Codex
+
+On Codex, each required builder plugin that has a Codex manifest goes through the guarded
+Salesforce Development recommendation and installation flow. Keep prompts host-neutral and keep
+reaching bundled files through `PLUGIN_ROOT`; the Codex adapter supplies it the same way. A
+successful install requires a new session and does not establish end-to-end support for a composite
+workflow.

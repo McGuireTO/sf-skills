@@ -1089,6 +1089,18 @@ def _is_ci() -> bool:
     )
 
 
+def session_identity(payload: Optional[dict] = None) -> str:
+    """Resolve the event or active host's opaque session without storing prompts."""
+    payload = payload if isinstance(payload, dict) else {}
+    explicit = payload.get("session_id") or payload.get("sessionId")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    active = os.environ.get("SF_AGENT_CLIENT")
+    if active == "claude" or (active != "codex" and os.environ.get("CLAUDE_CODE_SESSION_ID")):
+        return os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    return _shim.host_session_id("", "codex")
+
+
 def _agent_harness() -> str:
     """Which agent harness is executing the plugin, as a CLOSED enum:
     claude-code | cursor | codex | copilot-cli | opencode | other.
@@ -1099,10 +1111,11 @@ def _agent_harness() -> str:
     process that actually spawned this script is Claude Code — so CLAUDE_CODE_* wins.
     Returns a fixed token only (never a raw env value), so no PII can leak; anything
     unrecognized is "other", which is itself the signal that a new harness is running
-    the plugin. NOTE: today capture only fires from Claude Code hooks, so this reads
-    "claude-code" in practice; the other values are for when the plugin runs under
-    those harnesses' own hook/plugin systems."""
+    the plugin. Codex lifecycle adapters explicitly select their host; Claude
+    retains precedence among inherited editor markers on its own hook path."""
     env = os.environ
+    if env.get("SF_AGENT_CLIENT") == "codex":
+        return "codex"
     # Claude Code (and Claude Desktop, same engine — env cannot separate them).
     # CLAUDE_CODE_CHILD_SESSION is set ONLY by Claude Code itself (not IDE-integrated
     # terminals), so it is the most precise "Claude Code spawned this" signal.
@@ -1905,6 +1918,23 @@ _FIRST_RUN_NOTICE_LINES = (
 )
 
 
+# The Codex notice names exactly the events the Codex adapter records. Codex hooks
+# carry no skill-activation signal, so no skill events are listed.
+_CODEX_FIRST_RUN_NOTICE_BODY = (
+    "This plugin collects the following usage data to help us",
+    "improve it: your operating system, the plugin version, the",
+    "coarse org type (scratch, sandbox, or production), the",
+    "connected org ID, a persistent machine ID, and the agent",
+    "running the plugin. It also records session start and end,",
+    "Salesforce CLI commands whose outcome the host reports,",
+    "MCP tool results, plugin subagent starts, and coarse error",
+    "categories. It collects plugin recommendations shown, plugin",
+    "install results, and recommendation setting changes made",
+    "through this plugin. If you submit a rating, it",
+    "also collects a numeric satisfaction rating -- never your",
+    "typed comments. Skill usage is not recorded.",
+)
+
 def first_run_notice_lines() -> Optional[list]:
     """Return the one-time telemetry notice as plain content lines (no rules) on
     the FIRST run ON THIS MACHINE, else None — and mark it shown so it never
@@ -1934,7 +1964,15 @@ def first_run_notice_lines() -> Optional[list]:
                 pass
         except FileExistsError:
             return None  # another process just showed it — don't repeat
-        return list(_FIRST_RUN_NOTICE_LINES)
+        lines = list(_FIRST_RUN_NOTICE_LINES)
+        if os.environ.get("SF_AGENT_CLIENT") == "codex":
+            start = lines.index("This plugin collects the following usage data to help us")
+            end = lines.index("typed comments.") + 1
+            lines[start:end] = _CODEX_FIRST_RUN_NOTICE_BODY
+            lines = [line.replace("  /salesforce-development:telemetry off",
+                                  "  " + shlex.quote(str(Path(__file__).resolve().parent / "sf-context")) + " telemetry off")
+                     for line in lines]
+        return lines
     except Exception:
         return None
 
@@ -2815,18 +2853,15 @@ def cmd_feedback_record(argv: list[str]) -> int:
     reason when a consent/scope/disclosure gate blocked it, or "error" with
     reason "invalid_rating" for anything not a bare integer 1-5.
 
-    Reads the session id itself from CLAUDE_CODE_SESSION_ID (the same host-
-    provided env var the old `echo ... | telemetry-capture feedback` pipeline
-    asked the model to interpolate into a shell one-liner) instead of requiring
-    a caller-supplied env expansion, so the whole invocation is a static,
-    literal command — no pipe, no variable expansion — that a narrow
-    allowed-tools rule can match without an approval prompt."""
+    Reads the opaque session id from the active host environment. The
+    invocation takes only a numeric rating; it requires no model-supplied
+    session interpolation, comments, pipes, or variable expansion."""
     raw = argv[2] if len(argv) > 2 else ""
     try:
         rating: object = int(str(raw), 10)
     except (TypeError, ValueError):
         rating = raw
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    session_id = session_identity()
     result, reason = capture_feedback_rating(rating, session_id)
     out = {"result": result}
     if reason:

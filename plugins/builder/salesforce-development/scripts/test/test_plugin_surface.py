@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit + parity tests for plugin_surface.py (remediation plan A3).
+"""Unit + parity tests for plugin_surface.py (the width remediation plan).
 
 Two things are proven here:
 
@@ -15,7 +15,7 @@ Two things are proven here:
    ``sf_context._sanitize_dynamic_text`` before comparing.
 
 2. CONTRACT -- ``fit_bullet_line`` never emits a line wider than the frame
-   (the <=80-cell product invariant A3 enforces), protects the plugin name,
+   (the <=80-cell product invariant the remediation enforces), protects the plugin name,
    treats the detail as sacrificial per mode, and preserves runnable commands
    intact in wrap mode.
 
@@ -261,7 +261,7 @@ class ResumeSurfaceShapeTests(unittest.TestCase):
 
 
 class FitBulletWidthContractTests(unittest.TestCase):
-    """The core A3 invariant: at the product frame width (80), no rendered line
+    """The core width invariant: at the product frame width (80), no rendered line
     ever exceeds the frame, across the full Unicode fixture set and every
     (lead, separator, detail, mode) combination the callers use."""
 

@@ -25,6 +25,27 @@ saved `compact` preference keeps reduced output rather than reverting to the ful
 commands (such as `/salesforce-development:status` and `/salesforce-development:discover`), safety
 advisories/gates, failures, and install guidance remain available in every mode.
 
+## Codex configuration and activation
+
+Codex uses the packaged `hooks/codex-hooks.json` and fourteen command projections.
+Review installed hooks through `/hooks`; an installed package alone does not establish
+trusted hooks or active skills. Restart in a fresh session after installation or updates,
+resubmit the request, and verify the refreshed skill inventory before continuing.
+
+Set `SF_PLUGIN_UI_MODE=full|plain|off` in the Codex launch environment. This takes precedence
+over the existing Claude UI option; Codex does not require Claude `userConfig` transport.
+Turning presentation off does not disable primary-session routing instructions or safety
+gates. Existing runtime environment controls, including `SFDX_LSP_DEPLOY_GATE` and telemetry
+opt-outs (`DO_NOT_TRACK=true` or `SF_DISABLE_TELEMETRY=true`), remain available. Do not assume
+that a setting accepted by Claude’s configuration UI is transported by Codex.
+
+Packaged canonical skills remain authoritative. Resolve their package-relative commands
+against the owning installed plugin and supply `SF_AGENT_CLIENT=codex` on Salesforce
+Development runtime calls; a hook cannot export that environment into later shell tools.
+If a required child skill is missing, use supported discovery/install with consent, then
+stop for fresh-session activation and verify it. Do not replace the missing workflow with
+an invented implementation.
+
 ## Guard Rails vs. Claude Code's Auto-Mode Classifier
 
 This plugin's gates fire **only** on `sf project deploy`, `sf project delete`, and
@@ -38,6 +59,10 @@ around a denial by re-shaping the command defeats the control while technically 
 don't.
 
 ## Opt-In Auto-Deploy
+
+This option applies to Claude hooks. Codex automatic deployment after file edits stays
+disabled, including when `SFDX_AUTO_DEPLOY=1` is present. Deploy through an explicit user
+request and the normal safety gates.
 
 Set `SFDX_AUTO_DEPLOY=1` to have `sf-deploy-gate auto-deploy` push a saved `force-app/**` edit
 (`Write`/`Edit`/`MultiEdit`) to your default org automatically after each save. Off by default. It

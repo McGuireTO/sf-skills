@@ -294,6 +294,16 @@ dictionary; whether the first-run telemetry notice must say so is an open copy r
 
 ## Accepted-proposal install mechanic
 
+### Host-specific install and activation
+
+Claude Code remains the authoritative ambient flow. When Codex explicitly invokes the shared
+runtime, it reuses the same proposal, selection, decline, trust, and source-confirmation decisions,
+but its runtime facts and handoff differ: installed state comes from enabled rows in
+`codex plugin list --json`, installation uses `codex plugin add`, and activation requires a new
+Codex session plus resubmission rather than `/reload-plugins`. Codex session markers use a separate
+namespace, so a proposal or pending confirmation from one host can never authorize the other. An
+unavailable Codex inventory remains fail-open, matching the existing Claude settings-read behavior.
+
 The workflow treats the user's explicit acceptance of a recommendation as the authorization to
 install a plugin from a trusted source. UserPromptSubmit pins that exact
 candidate and routes one fixed command: `plugin-install <name> --accept-proposed`. The runtime

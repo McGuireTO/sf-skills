@@ -7,6 +7,14 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-16
+
+### Added
+
+- Native Codex plugin packaging and advisory post-edit checks for contained LWC files in an
+  SFDX project. Automatic checks use bundled Python SLDS/template validators only; optional
+  SLDS Linter and Code Analyzer require explicit validation. Claude registration is unchanged.
+
 ## [0.2.0] — 2026-09-21
 
 ### Added

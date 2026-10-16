@@ -1,0 +1,23 @@
+{
+  "name": "agentforce-adlc",
+  "version": "0.13.0",
+  "description": "Agentforce Agent Development Life Cycle — author, discover, scaffold, deploy, test, secure, and optimize .agent files",
+  "author": {
+    "name": "Salesforce"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "agentforce",
+    "agent-script",
+    "salesforce",
+    "adlc"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agentforce ADLC",
+    "shortDescription": "Agentforce Agent Development Life Cycle",
+    "developerName": "Salesforce",
+    "category": "Developer Tools",
+    "websiteURL": "https://github.com/forcedotcom/sf-skills"
+  }
+}

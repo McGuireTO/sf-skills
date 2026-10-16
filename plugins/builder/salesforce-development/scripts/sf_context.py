@@ -34,6 +34,10 @@ import shutil
 import stat
 import subprocess
 import sys
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - Python < 3.11 keeps the CLI fallback.
+    tomllib = None
 import tempfile
 import time
 import unicodedata
@@ -158,6 +162,26 @@ def _cli_timeout() -> int:
     return 30 if _is_windows() else 10
 
 
+# Monotonic deadline for one hook invocation, or None when unbounded. Codex
+# prompt dispatch sets it so every CLI call shares one overall budget below the
+# host's hook timeout; Claude paths leave it unset.
+_HOOK_DEADLINE: Optional[float] = None
+_CODEX_PROMPT_BUDGET_SECONDS = 8.0
+
+
+def _bounded_hook_timeout(timeout: float) -> Optional[float]:
+    """Cap ``timeout`` at the time left before the hook deadline.
+
+    Returns None when the deadline has passed, so the caller skips spawning.
+    """
+    if _HOOK_DEADLINE is None:
+        return timeout
+    remaining = _HOOK_DEADLINE - time.monotonic()
+    if remaining <= 0.1:
+        return None
+    return min(timeout, remaining)
+
+
 def _check_tools_workers() -> int:
     """check-tools concurrency. Fewer workers on Windows to cut the cold-start
     contention between parallel slow `sf.cmd` spawns that caused first-run false
@@ -185,6 +209,9 @@ def run_result(cmd: list, timeout: Optional[int] = None) -> RunResult:
         return RunResult(False, "", None, "empty")
     if timeout is None:
         timeout = _cli_timeout()
+    timeout = _bounded_hook_timeout(timeout)
+    if timeout is None:
+        return RunResult(False, "", None, "timeout")
     argv = build_command(cmd[0], cmd[1:])
     if argv is None:
         # Missing on PATH, or refused (cmd metacharacters on a shim path).
@@ -298,6 +325,9 @@ def emit(
     session_title: Optional[str] = None,
 ) -> None:
     """Print a hook output JSON object."""
+    message, reason, system_message = (
+        _host_text(message), _host_text(reason) if reason else reason,
+        _host_text(system_message) if system_message else system_message)
     output: dict = {"hookSpecificOutput": {"hookEventName": event}}
     if decision:
         output["hookSpecificOutput"]["permissionDecision"] = decision
@@ -942,7 +972,7 @@ def _session_model_context(
         "reached: " + (", ".join(_clip(name, 24) for name in reached) or "none"),
         "no evidence: " + (", ".join(_clip(name, 24) for name in no_evidence) or "none"),
         f"next action: {_clip(_nudge_next_action_text(candidate), 88)}",
-        f"discovery: {DISCOVERY_POINTER}",
+        f"discovery: {_host_text(DISCOVERY_POINTER)}",
         SKILLS_FIRST_COMPACT.strip(),
         ORIENTATION_DIRECTIVE.strip(),
     ]
@@ -1115,6 +1145,22 @@ def _dotted_wordmark() -> Optional[str]:
         return (Path(__file__).with_name(_WORDMARK_ART_FILE)).read_text(encoding="utf-8").rstrip("\n")
     except _ARTIFACT_READ_ERRORS:
         return None
+
+
+def _plain_lockup() -> str:
+    """Return the host-appropriate non-ANSI SALESFORCE lockup.
+
+    Codex hook messages must stay free of SGR sequences, but the raster's visible
+    glyph geometry remains legible without its color ramp. Keep that current
+    lockup for Codex instead of reverting its banner to the retired FIGlet block.
+    Other plain outputs retain the FIGlet fallback because they are model-reproduced
+    or accessibility-oriented text surfaces.
+    """
+    if _plugin_client() == "codex":
+        raster = _dotted_wordmark()
+        if raster:
+            return _ANSI_RE.sub("", raster)
+    return BANNER
 
 
 def _paint_lockup(art: str) -> str:
@@ -1319,7 +1365,7 @@ _UI_MODE_LEGACY_ALIASES = {"compact": "plain"}
 
 def _ui_mode() -> str:
     """Return the validated plugin UI option; malformed input is never silence."""
-    raw = os.environ.get("CLAUDE_PLUGIN_OPTION_UI_MODE", "")
+    raw = os.environ.get("SF_PLUGIN_UI_MODE") or os.environ.get("CLAUDE_PLUGIN_OPTION_UI_MODE", "")
     raw = _UI_MODE_LEGACY_ALIASES.get(raw, raw)
     return raw if raw in _UI_MODES else "full"
 
@@ -1517,7 +1563,7 @@ def _banner_provenance(plugin_root: Optional[Path] = None) -> dict:
                 raise TypeError("invalid catalog plugin entry")
             if name == current_name or (enabled is not None and name in enabled):
                 installed += 1
-            else:
+            elif _plugin_recommendation_supported(name):
                 available += 1
         facts["installedPlugins"] = installed
         facts["availablePlugins"] = available
@@ -1561,7 +1607,7 @@ def render_banner_block(
             # Colorization must never raise on the SessionStart hot path; a
             # crashing hook degrades the whole session. Fall through to plain.
             pass
-    return "\n".join([BANNER, f"{BANNER_WORDMARK}   ·   v{version}"])
+    return "\n".join([_plain_lockup(), f"{BANNER_WORDMARK}   ·   v{version}"])
 
 
 def render_box(title: str, rows: list[tuple[str, str]], width: int = 60) -> str:
@@ -1920,7 +1966,8 @@ def _wayfinding_footer(next_line: Optional[str] = None, *, color: bool = False) 
     computed step where a surface still wants one (the readiness banner's "Next: …"). Returns
     paint lines; when color is off each line is its plain text, and `strip_ansi(line)`
     equals the plain text when on."""
-    lines = [_paint_line([segment], color=color) for segment in _WAYFINDING_LINES]
+    lines = [_paint_line([(_host_text(text), style)], color=color)
+             for text, style in _WAYFINDING_LINES]
     if next_line:
         lines.append(_paint_line([(next_line, "body")], color=color))
     return lines
@@ -2196,7 +2243,7 @@ def render_wayfinder_message(org: dict, project: dict, stats: dict, git_line: st
         parts += [""] + _render_nudge_inline(resolved_state, candidate, color=color, include_context=False)
     # Brand bright-blue, matching the SessionStart footer pointer (slot 6) — the two
     # onboarding pointers stay unified in the brand hue, not a generic cyan link.
-    parts += ["", _paint_line([(DISCOVERY_POINTER, "brand")], color=color)]
+    parts += ["", _paint_line([(_host_text(DISCOVERY_POINTER), "brand")], color=color)]
     return "\n".join(parts)
 
 
@@ -2248,11 +2295,12 @@ def _detect_update_notice() -> Optional[dict]:
     # which only returns stdout — but we still resolve `sf` cross-platform via
     # build_command so a Windows `sf.cmd` shim is launched correctly (W-23466799 / WIN-026).
     argv = build_command("sf", ["version"])
-    if argv is None:
+    timeout = _bounded_hook_timeout(_cli_timeout())
+    if argv is None or timeout is None:
         return None
     try:
         result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=_cli_timeout(), shell=False
+            argv, capture_output=True, text=True, timeout=timeout, shell=False
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
@@ -3013,8 +3061,10 @@ def _prompt_context(payload: dict, *, rotate_fallback: bool = False) -> Optional
     """Resolve one native/fallback prompt namespace, or None on invalid state.
 
     Only UserPromptSubmit passes rotate_fallback=True. Later hooks without native
-    prompt_id read that session's current token; a missing/corrupt token therefore
-    fails open instead of suppressing current guidance.
+    prompt_id read that session's current token. None means guidance cannot be
+    suppressed via the prompt ledger; it does not itself exempt skills-first
+    enforcement. Only absent host ids/fallback in a healthy subagent runtime
+    qualify for the skills-first advisory exception.
     """
     if not isinstance(payload, dict):
         return None
@@ -3288,6 +3338,32 @@ def _prune_prompt_runtime(current: Optional[PromptContext]) -> None:
         pass
 
 
+def _subagent_missing_prompt_context(payload: dict) -> bool:
+    """Allow an advisory only for absent prompt ids in a healthy runtime.
+
+    Invalid ids, unsafe directories, and unreadable/corrupt fallback markers are
+    runtime failures, not evidence that the host omitted prompt context.
+    """
+    if not _hook_from_subagent(payload):
+        return False
+    session_id = _runtime_id(payload.get("session_id") or payload.get("sessionId"))
+    if (session_id is None or payload.get("prompt_id") is not None
+            or payload.get("promptId") is not None):
+        return False
+    if not _ensure_private_runtime_dir(_PROMPT_RUNTIME_DIR):
+        return False
+    session_path = _PROMPT_RUNTIME_DIR / _runtime_key(session_id)
+    if not _ensure_private_runtime_dir(session_path):
+        return False
+    try:
+        (session_path / "current-fallback").lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _record_dispatched_skill(context: Optional[PromptContext], skill: str) -> None:
     if context is None or not isinstance(skill, str) or not _SKILL_NAME_PATTERN.fullmatch(skill):
         return
@@ -3345,7 +3421,8 @@ def _dispatched_skills(context: Optional[PromptContext]) -> set[str]:
 # names only count for the current prompt via the PreToolUse ledger. The deny therefore
 # asks for the qualified name.
 # Subagent hooks carry the parent's session_id but their own context, so a subagent
-# neither writes nor reads this ledger (it keeps the per-prompt behavior).
+# neither writes nor reads this ledger. It uses the per-prompt ledger when
+# resolvable; absent host prompt context in a healthy runtime gets an advisory.
 #
 # Compaction may truncate or drop re-attached skill content while keeping the same
 # session_id, so every SessionStart (compact/clear/resume/fork/...) discards this
@@ -4499,7 +4576,7 @@ def cmd_detect() -> int:
         # it. The old three-line quick-start body collapsed to this single line (the
         # concrete next action reaches the model through the additionalContext channel).
         org_group = [[("org: ", "body"),
-                      (_clip("none set — /salesforce-development:login", 73), "muted")]]
+                      (_clip(_host_text("none set — /salesforce-development:login"), 73), "muted")]]
         msg = render_degraded_banner(
             org_group, project=project, stats=stats, git_line=git_line, state=state,
             notice_lines=notice_lines, candidate=candidate) if stats is not None else ""
@@ -4522,7 +4599,7 @@ def cmd_detect() -> int:
         # command from being clipped. Clipped after the "org: " label so the whole
         # line holds ≤80 columns on any alias.
         rest = (f"{_sanitize_dynamic_text(target)}"
-                " — /salesforce-development:status")
+                + _host_text(" — /salesforce-development:status"))
         org_group = [[("org: ", "body"), (_clip(rest, 73), "muted")]]
         msg = render_degraded_banner(
             org_group, project=project, stats=stats, git_line=git_line, state=state,
@@ -4572,7 +4649,9 @@ def cmd_detect() -> int:
     return 0
 
 
-def cmd_verify_org() -> int:
+def cmd_verify_org(*, command_verified: bool = False) -> int:
+    # Host adapters may supply a lexical deploy/delete match. The pending command
+    # stays intact while the org checks share this implementation.
     # Self-gate on the command: this gate fails CLOSED (denies) before a deploy or
     # delete, so it must run ONLY on those commands. Some Claude Code builds ignore
     # the plugin.json `if:` matcher and fire every PreToolUse Bash hook on every
@@ -4580,7 +4659,7 @@ def cmd_verify_org() -> int:
     # whenever no org is set, blocking ordinary shell use. Anything that is not a
     # deploy/delete is always allowed, before any CLI work.
     payload = _read_hook_payload()
-    if not _DEPLOY_OR_DELETE_COMMAND.search(_hook_command(payload)):
+    if not command_verified and not _DEPLOY_OR_DELETE_COMMAND.search(_hook_command(payload)):
         print(json.dumps({"continue": True}))
         return 0
 
@@ -5621,7 +5700,12 @@ def _live_mcp_summary(active_org=None) -> str:
     directly (no org filter needed). For any server whose probe could not run at
     all (missing bundle / timeout / offline), we fall back to that server's
     last-known org-filtered sidecar, so a transient failure degrades to the
-    cached reading instead of erasing it."""
+    cached reading instead of erasing it.
+
+    Under a hook deadline the passive sidecar read is used instead, so a
+    bounded prompt hook never waits on JWT minting or server round-trips."""
+    if _HOOK_DEADLINE is not None:
+        return _passive_mcp_summary(active_org)
     slugs = list(_MCP_SERVER_SLUGS.values())
     results: dict = {}
     if slugs:
@@ -6480,9 +6564,11 @@ def _has_no_owning_skill(path: str) -> bool:
 
 
 # Enforcement allow-list: only these skills are BLOCKED (deny + redirect). Each
-# owns a 1:1 bypass-prone `sf` op, so a deny is always satisfiable by dispatching
-# it. Everything else `_skills_first_match` returns stays warn-only, so a hard
-# deny can never name a nonexistent skill or block a step with no single owner.
+# owns a 1:1 bypass-prone `sf` op, so a deny is satisfiable by dispatching it (a
+# subagent with no resolvable prompt context gets the advisory instead, since no
+# dispatch could be recorded to clear it). Everything else `_skills_first_match`
+# returns stays warn-only, so a hard deny can never name a nonexistent skill or
+# block a step with no single owner.
 _ENFORCEABLE_SKILLS = frozenset({
     "platform-soql-query",
     "platform-metadata-retrieve",
@@ -6491,11 +6577,16 @@ _ENFORCEABLE_SKILLS = frozenset({
 })
 
 # Map an enforced skill to sibling skills whose dispatch (this prompt or, once
-# loaded, this session) ALSO satisfies its deny (the owning skill itself always does;
-# these are added). platform-soql-query delegates query EXECUTION to
-# platform-data-manage, so a session where the delegate dispatched is just as validated — its `sf data query` must flow through, not re-deny.
+# loaded, this session) ALSO satisfies its deny. The owning skill always satisfies
+# it too. Delegates apply to every operation matched to the owning skill.
 _DISPATCH_DELEGATES = {
+    # Query execution is delegated to platform-data-manage, so its sf data query
+    # calls must flow through after dispatch.
     "platform-soql-query": frozenset({"platform-data-manage"}),
+    # The destructive skill writes destructiveChangesPre/Post.xml (Step 1c) and
+    # an empty package.xml (Phase 2). This also allows raw manifest CLI generation
+    # because both operations match platform-manifest-generate (sf-skills#359).
+    "platform-manifest-generate": frozenset({"platform-destructive-deploy"}),
 }
 # The only skills the session-scoped ledger (sf-skills#355) records or honors.
 _SESSION_DISPATCH_SKILLS = _ENFORCEABLE_SKILLS.union(*_DISPATCH_DELEGATES.values())
@@ -6717,7 +6808,8 @@ def cmd_skills_first_advisory() -> int:
     tool_input}` JSON), the same channel sf-deploy-gate uses.
 
     A bypass-prone op whose owning skill is on the `_ENFORCEABLE_SKILLS`
-    allow-list is BLOCKED with a `deny` + redirect to that skill. Every other
+    allow-list is denied with a redirect unless its dispatch ledger is satisfied
+    or a subagent has no prompt ids/fallback in a healthy runtime. Every other
     match — the generic metadata fallback and Apex/declarative authoring nudges —
     is WARN-ONLY (emits `continue: true`), so a deny can never point at a skill
     that does not exist or block a step with no single owning skill.
@@ -6846,7 +6938,9 @@ def cmd_skills_first_advisory() -> int:
         deny_lines = []
         warn_lines = []
         for candidate in candidates:
-            line = f"- `{candidate['name']}`: run `{candidate['install_command']}` (confirm with the user first)"
+            install = (candidate['install_command'] if _plugin_client() == "codex"
+                       else f"run `{candidate['install_command']}`")
+            line = f"- `{candidate['name']}`: {install} (confirm with the user first)"
             if candidate["band"] == "high" and candidate["first_occurrence"]:
                 deny_lines.append(line)
             else:
@@ -6888,18 +6982,20 @@ def cmd_skills_first_advisory() -> int:
     if not _hook_from_subagent(payload):
         dispatched |= _session_dispatched_skills(session_id)
     # The deny is satisfied by the owning skill OR any delegate it hands the call
-    # to (platform-soql-query → platform-data-manage), so the delegate's own call
-    # flows through instead of re-denying.
+    # to (platform-soql-query → platform-data-manage, platform-manifest-generate →
+    # platform-destructive-deploy), so the delegate's own call flows through
+    # instead of re-denying.
     satisfying = {skill} | _DISPATCH_DELEGATES.get(skill, frozenset())
     if dispatched & satisfying:
         print(json.dumps({"continue": True}))
         return 0
 
-    # Enforcement: promote the nudge to a blocking deny so the model dispatches the
-    # owning skill instead of a raw CLI/manifest write. Only `_ENFORCEABLE_SKILLS`
-    # denies. The suppression above already cleared any op whose owning skill
-    # dispatched this prompt or session, so the deny cannot deadlock the workflow.
-    if skill in _ENFORCEABLE_SKILLS:
+    # Enforced owners require dispatch unless this subagent has no host prompt
+    # ids or fallback in an otherwise healthy runtime (sf-skills#362). Its dispatch
+    # records nowhere and it cannot use the parent's session ledger. Runtime/owner
+    # failures and invalid or corrupt ids still deny; they must not disable the gate.
+    if skill in _ENFORCEABLE_SKILLS and not (
+            prompt_context is None and _subagent_missing_prompt_context(payload)):
         reason = (
             f"Skills-first enforcement: this looks like {why}. Dispatch the "
             f"`{_qualified_skill(skill)}` skill instead — it owns this operation and encodes the "
@@ -7110,14 +7206,14 @@ def cmd_scaffold_paint(payload: dict) -> int:
                 org_display=None,
             )
             org_group = [[("org: ", "body"),
-                          (_clip("none set — /salesforce-development:login", 73), "muted")]]
+                          (_clip(_host_text("none set — /salesforce-development:login"), 73), "muted")]]
         else:
             state = _derive_journey_state(
                 created_root, has_project=True, target=target,
                 target_error="unprobed", org_display=None,
             )
             rest = (f"{_sanitize_dynamic_text(target)}"
-                    " — /salesforce-development:status")
+                    + _host_text(" — /salesforce-development:status"))
             org_group = [[("org: ", "body"), (_clip(rest, 73), "muted")]]
 
         # Resolve the journey nudge for the just-created project and thread it through
@@ -7793,7 +7889,9 @@ def _journey_state_with_org(project_root: Optional[Path] = None) -> tuple:
     org_display: Optional[dict] = None
     if has_project:
         target, target_error = get_target_org_detailed()
-        if target:
+        if target and _HOOK_DEADLINE is not None and not target_error:
+            target_error = "unprobed"
+        elif target:
             org_display = get_org_display(target)
     state = _derive_journey_state(
         root,
@@ -7831,6 +7929,18 @@ def _resolve_position_and_org(root: Path) -> tuple[dict, Optional[dict]]:
     target, target_error = get_target_org_detailed()
     org: Optional[dict] = None
     org_display: Optional[dict] = None
+    if target and not target_error and _HOOK_DEADLINE is not None:
+        # Bounded hooks read only the local `org list` record: no live
+        # `org display`, so the band states the org without a reachability claim.
+        org_list_data = get_org_list()
+        pool_rows = (org_list_data.get("nonScratchOrgs") or []) + (
+            org_list_data.get("scratchOrgs") or [])
+        if any(row.get("alias") == target or row.get("username") == target
+               for row in pool_rows if isinstance(row, dict)):
+            org = resolve_org_info(target, org_list=org_list_data, org_display={})
+        state = _derive_journey_state(root, has_project=True, target=target,
+                                      target_error="unprobed", org_display=None)
+        return state, org
     if target and not target_error:
         with ThreadPoolExecutor(max_workers=2) as pool:
             list_fut = pool.submit(get_org_list)
@@ -9870,7 +9980,8 @@ _PLUGIN_EXPLICIT_ACTION_REQUEST = re.compile(
     rf"|^\s*how\s+(?:do|can|could|should|would)\s+(?:i|we|you)\s+"
     rf"{_PLUGIN_ACTION_VERB}\b"
     rf"|^\s*what\s+should\s+(?:i|we|you)\s+{_PLUGIN_ACTION_VERB}\b"
-    rf"|^\s*need\s+to\s+{_PLUGIN_ACTION_VERB}\b",
+    rf"|^\s*need\s+to\s+{_PLUGIN_ACTION_VERB}\b"
+    rf"|^\s*(?:ok(?:ay)?[,.]?\s+)?let(?:'?s|\s+us)\s+{_PLUGIN_ACTION_VERB}\b",
     re.IGNORECASE,
 )
 # Action verbs can also be nouns or noun modifiers. Treat a bare sentence as an
@@ -9910,7 +10021,82 @@ _PLUGIN_DIAGNOSTIC_REQUEST = re.compile(
 )
 
 
-def _plugin_session_id(explicit_session_id: object = "") -> str:
+_PLUGIN_CLIENTS = frozenset({"claude", "codex"})
+# Temporary, explicit Codex recommendation exclusions. Every current builder plugin has a native
+# Codex manifest and is recommendable; retain the set only for a future host-incompatible plugin.
+_CODEX_UNVERIFIED_WORKFLOW_PLUGINS: frozenset = frozenset()
+
+
+def _plugin_recommendation_supported(name: object, client: object = None) -> bool:
+    """Exclude deferred plugins from Codex recommendations."""
+    return not (
+        _plugin_client(client) == "codex"
+        and isinstance(name, str)
+        and name in _CODEX_UNVERIFIED_WORKFLOW_PLUGINS
+    )
+
+
+_HOST_COMMAND_RE = re.compile(
+    r"(`?)(?:the )?/salesforce-development:([a-z-]+)( overview)?(?: command)?\1")
+
+
+def _host_text(text: str) -> str:
+    """Rewrite Claude slash-command references for the active host.
+
+    Codex projects plugin commands as skills, not slash commands (`/plugin:command` is
+    rejected there), so on Codex a `/salesforce-development:<name>` reference becomes a
+    plain-language request for that workflow. Claude text is returned unchanged.
+    """
+    if not isinstance(text, str) or _plugin_client() != "codex":
+        return text
+
+    def _sub(match: "re.Match[str]") -> str:
+        name = match.group(2)
+        suffix = " for an overview" if match.group(3) else ""
+        return f"the Salesforce Development {name} workflow{suffix}"
+
+    return _HOST_COMMAND_RE.sub(_sub, text)
+
+
+def _host_run_prefix() -> str:
+    """Verb to put before a `_host_text` workflow phrase where Claude prints a bare command."""
+    return "ask Codex to run " if _plugin_client() == "codex" else ""
+
+
+def _plugin_install_command(name: str) -> str:
+    """Install instruction for one plugin on the active host."""
+    if _plugin_client() == "codex":
+        return f"ask Codex to install the {name} plugin (guarded plugin-install flow)"
+    return f"{_PLUGIN_INSTALL_COMMAND_PREFIX} {name}"
+
+
+def _plugin_client(requested: object = None) -> str:
+    """Return the active host without changing the legacy Claude default."""
+    if isinstance(requested, str) and requested in _PLUGIN_CLIENTS:
+        return requested
+    explicit = os.environ.get("SF_AGENT_CLIENT", "").strip().lower()
+    if explicit in _PLUGIN_CLIENTS:
+        return explicit
+    return "claude"
+
+
+def _activate_host_working_directory(payload: dict, client: object = None) -> None:
+    """Use the project cwd supplied by Codex plugin hook events."""
+    if _plugin_client(client) != "codex" or not isinstance(payload, dict):
+        return
+    raw = payload.get("cwd")
+    if not isinstance(raw, str):
+        return
+    path = Path(raw)
+    if not path.is_absolute():
+        return
+    try:
+        os.chdir(path)
+    except OSError:
+        pass
+
+
+def _plugin_session_id(explicit_session_id: object = "", client: object = None) -> str:
     """Resolve the proposal/install session without asking the model to copy it.
 
     Claude Code exposes ``CLAUDE_CODE_SESSION_ID`` to Bash/PowerShell tool
@@ -9920,10 +10106,11 @@ def _plugin_session_id(explicit_session_id: object = "") -> str:
     proposal namespace: decline correlation must fail closed when the host cannot
     prove the session.
     """
-    if isinstance(explicit_session_id, str) and explicit_session_id:
-        return explicit_session_id
-    environment_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    return _runtime_id(environment_session_id) or ""
+    active_client = _plugin_client(client)
+    resolved = _shim.host_session_id(explicit_session_id, active_client)
+    # Keep every existing Claude marker path byte-for-byte stable. Codex gets a
+    # distinct namespace even if both hosts expose the same opaque session id.
+    return f"codex:{resolved}" if active_client == "codex" and resolved else resolved
 
 
 def _plugin_proposal_path(session_id: str) -> Path:
@@ -10129,6 +10316,179 @@ def _clear_plugin_install_pending(session_id: str, name: Optional[str] = None) -
         return False
     except OSError:
         return False
+
+
+def _confirm_plugin_install_pending(session_id: str, name: str, nonce: str) -> bool:
+    """Stamp the pending source preview with the user's own confirmation time.
+
+    Written only from UserPromptSubmit, so the stamp proves the user replied to
+    this preview after it was created. A later dry run rewrites the marker
+    without the stamp.
+    """
+    pending = _load_plugin_install_pending(session_id)
+    if (pending is None or pending.get("name") != name
+            or not hmac.compare_digest(pending.get("nonce", ""), nonce)):
+        return False
+    text = _private_text(
+        _plugin_install_pending_path(session_id),
+        max_bytes=_PLUGIN_INSTALL_PENDING_MAX_BYTES,
+    )
+    try:
+        data = json.loads(text or "")
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    data["confirmedAt"] = max(int(time.time()), int(data.get("createdAt", 0)))
+    encoded = json.dumps(data, separators=(",", ":"))
+    if len(encoded) > _PLUGIN_INSTALL_PENDING_MAX_BYTES:
+        return False
+    return _atomic_private_text(_plugin_install_pending_path(session_id), encoded)
+
+
+def _consume_plugin_install_pending(
+    session_id: str, name: str, nonce: str, *, require_user_confirmation: bool = False,
+) -> bool:
+    """Atomically claim and consume one matching source-preview authorization.
+
+    ``require_user_confirmation`` additionally requires the UserPromptSubmit
+    stamp written by ``_confirm_plugin_install_pending`` for this preview.
+    """
+    if (not session_id or not isinstance(name, str)
+            or not _SKILL_NAME_PATTERN.fullmatch(name)
+            or not isinstance(nonce, str) or not _PLUGIN_INSTALL_NONCE.fullmatch(nonce)):
+        return False
+    source = _plugin_install_pending_path(session_id)
+    claim = source.with_name(
+        f"{source.name}.claim-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    try:
+        os.replace(source, claim)
+    except OSError:
+        return False
+    try:
+        text = _private_text(claim, max_bytes=_PLUGIN_INSTALL_PENDING_MAX_BYTES)
+        if text is None:
+            return False
+        try:
+            pending = json.loads(text)
+        except json.JSONDecodeError:
+            return False
+        created_at = pending.get("createdAt") if isinstance(pending, dict) else None
+        if (not isinstance(created_at, (int, float)) or isinstance(created_at, bool)
+                or time.time() - created_at < -300
+                or time.time() - created_at > _PLUGIN_INSTALL_PENDING_MAX_AGE_SECONDS):
+            return False
+        if require_user_confirmation:
+            confirmed_at = pending.get("confirmedAt")
+            if (not isinstance(confirmed_at, (int, float)) or isinstance(confirmed_at, bool)
+                    or confirmed_at < created_at or confirmed_at - time.time() > 300):
+                return False
+        return (
+            pending.get("name") == name
+            and isinstance(pending.get("nonce"), str)
+            and hmac.compare_digest(pending["nonce"], nonce)
+        )
+    finally:
+        try:
+            claim.unlink()
+        except OSError:
+            pass
+
+
+# Codex production-deploy consent. Codex has no per-command approval prompt, so
+# a production deploy proceeds only after the user's own prompt is exactly the
+# confirmation phrase naming the org. UserPromptSubmit records it; the shell hook
+# consumes it once, for that org, within the TTL.
+_PROD_DEPLOY_CONFIRM_DIR = _PROMPT_RUNTIME_DIR / "prod-deploy-confirm"
+_PROD_DEPLOY_CONFIRM_TTL_SECONDS = 600
+_PROD_DEPLOY_CONFIRM_MAX_BYTES = 512
+_PROD_DEPLOY_CONFIRMATION = re.compile(
+    r"\s*(?:yes[,.!]?\s+)?confirm\s+production\s+deploy(?:ment)?\s+to\s+"
+    r"(?P<alias>[A-Za-z0-9](?:[A-Za-z0-9._@+-]{0,126}[A-Za-z0-9])?)\s*[.!]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _prod_deploy_confirmation_alias(prompt: object) -> Optional[str]:
+    """The org named by a prompt that is wholly the affirmative confirmation phrase."""
+    if not isinstance(prompt, str):
+        return None
+    match = _PROD_DEPLOY_CONFIRMATION.fullmatch(prompt)
+    return match.group("alias") if match else None
+
+
+def _prod_deploy_confirm_path(session_id: str) -> Path:
+    return _PROD_DEPLOY_CONFIRM_DIR / f"{_runtime_key(session_id)}.json"
+
+
+def _record_prod_deploy_confirmation(session_id: str, alias: str) -> bool:
+    if not session_id or not alias or not _ensure_private_runtime_dir(_PROD_DEPLOY_CONFIRM_DIR):
+        return False
+    encoded = json.dumps({"alias": alias, "createdAt": int(time.time())},
+                         separators=(",", ":"))
+    if len(encoded) > _PROD_DEPLOY_CONFIRM_MAX_BYTES:
+        return False
+    return _atomic_private_text(_prod_deploy_confirm_path(session_id), encoded)
+
+
+def _prod_deploy_confirmation_matches(text: object, target: str) -> bool:
+    """Whether a recorded confirmation is fresh and names ``target``."""
+    try:
+        data = json.loads(text or "")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    alias, created_at = data.get("alias"), data.get("createdAt")
+    if (not isinstance(alias, str) or isinstance(created_at, bool)
+            or not isinstance(created_at, (int, float))):
+        return False
+    age = time.time() - created_at
+    return (-300 <= age <= _PROD_DEPLOY_CONFIRM_TTL_SECONDS
+            and alias == target)
+
+
+def _peek_prod_deploy_confirmation(host_session_id: object, target: object) -> bool:
+    """Whether the session holds a live confirmation for ``target``; consumes nothing.
+
+    The shell hook peeks to decide the gate verdict and consumes only once every
+    check has allowed the command, so an unrelated or later-denied call never
+    spends the user's confirmation.
+    """
+    session_id = _plugin_session_id(host_session_id or "", "codex")
+    if not session_id or not isinstance(target, str) or not target:
+        return False
+    text = _private_text(_prod_deploy_confirm_path(session_id),
+                         max_bytes=_PROD_DEPLOY_CONFIRM_MAX_BYTES)
+    return _prod_deploy_confirmation_matches(text, target)
+
+
+def _consume_prod_deploy_confirmation(host_session_id: object, target: object) -> bool:
+    """Claim the session's recorded confirmation once; True only for ``target``.
+
+    The claim is an atomic rename, so concurrent callers cannot both succeed.
+    ``host_session_id`` is the hook event's session id; it maps to the same
+    namespace the UserPromptSubmit hook recorded under. A confirmation naming a
+    different org is claimed and discarded, which is why callers peek first.
+    """
+    session_id = _plugin_session_id(host_session_id or "", "codex")
+    if not session_id or not isinstance(target, str) or not target:
+        return False
+    source = _prod_deploy_confirm_path(session_id)
+    claim = source.with_name(f"{source.name}.claim-{os.getpid()}-{secrets.token_hex(8)}")
+    try:
+        os.replace(source, claim)
+    except OSError:
+        return False
+    try:
+        return _prod_deploy_confirmation_matches(
+            _private_text(claim, max_bytes=_PROD_DEPLOY_CONFIRM_MAX_BYTES), target)
+    finally:
+        try:
+            claim.unlink()
+        except OSError:
+            pass
 
 
 def _drive_marker_path() -> Path:
@@ -10690,8 +11050,8 @@ def _decline_verb_governs_name(prompt: str, name: str) -> bool:
         r"would\s+you(?:\s+please)?|let(?:'?s|\s+us)(?:\s+go\s+ahead\s+and)?|"
         r"i(?:'d|\s+would)?\s*(?:like\s+to|want\s+to)?)\s+)?"
     )
-    obj = r"(?:\s+(?:it|this|that|the\s+plugin))?\s+"
-    trailer = r"(?:\s+(?:please|now|today|for\s+me|thanks|thank\s+you))?\s*[.!]?\s*$"
+    obj = r"(?:\s+(?:it|this|that|the\s+plugin))?\s+(?:the\s+)?"
+    trailer = r"(?:\s+plugin)?(?:\s+(?:please|now|today|for\s+me|thanks|thank\s+you))?\s*[.!]?\s*$"
     direct = rf"^\s*{lead_in}(?:decline|reject|skip)\b{obj}{escaped}{trailer}"
     # The optional "want/wish to" between the negation and the verb keeps this the
     # mirror of the acceptance lead-in's "i want to install ..." form, so "I don't
@@ -10759,8 +11119,9 @@ def _install_verb_governs_name(prompt: str, name: str) -> bool:
         r"would\s+you(?:\s+please)?|let(?:'?s|\s+us)(?:\s+go\s+ahead\s+and)?|"
         r"i(?:'d|\s+would)?\s*(?:like\s+to|want\s+to)?)\s+)?"
         r"(?:install|add|enable|accept|go\s+ahead\s+with)\b"
-        r"(?:\s+(?:it|this|that|the\s+plugin))?\s+"
+        r"(?:\s+(?:it|this|that|the\s+plugin))?\s+(?:the\s+)?"
         rf"{escaped}"
+        r"(?:\s+plugin)?"
         r"(?:\s+(?:please|now|today|for\s+me|thanks|thank\s+you))?\s*[.!]?\s*$"
     )
     bare_ack = rf"^\s*(?:yes|yep|yeah|sure|ok(?:ay)?)\s*[,.]?\s+{escaped}\s*[.!]?\s*$"
@@ -10862,7 +11223,25 @@ def _plugin_decline_recorded_note(name: str, recorded: bool) -> str:
     )
 
 
-def _plugin_install_route_note(name: str, consent: str = "explicit") -> str:
+def _codex_install_escalation_note(client: object = None) -> str:
+    """Codex-only: the install writes under ``~/.codex``, outside the sandbox.
+
+    ``codex plugin add`` mutates the Codex home, which the default workspace-write
+    sandbox keeps read-only, so an unescalated run fails with a bare exit 1. The
+    command string stays byte-identical; only the tool-call permission is asked for.
+    """
+    if _plugin_client(client) != "codex":
+        return ""
+    return (
+        " Run it with sandbox_permissions=\"require_escalated\" and a justification such "
+        "as \"Install a Salesforce plugin into the Codex home\", because the install "
+        "writes outside the workspace sandbox and fails with exit 1 without it."
+    )
+
+
+def _plugin_install_route_note(
+    name: str, consent: str = "explicit", client: object = None,
+) -> str:
     """Model instruction for a natural-language, same-session install request.
 
     ``consent`` distinguishes how the acceptance arrived, so the directive never
@@ -10872,11 +11251,10 @@ def _plugin_install_route_note(name: str, consent: str = "explicit") -> str:
     one-shot last-offer marker, to the single offer an *earlier* turn's topic
     change had just cleared (Feature b); and
     ``structured`` is an AskUserQuestion selection that named exactly one open
-    proposal (Feature a). Everything after the opening sentence -- crucially the
-    exact ``plugin-install <name> --accept-proposed`` command substring -- is
-    byte-identical across all values, so the fixed-grammar control command and every
-    downstream guard are unaffected. An unrecognized value is treated as ``inferred``
-    (the more conservative wording).
+    proposal (Feature a). Everything after the opening sentence is identical for a
+    given host; Codex appends its explicit client selector to the fixed-grammar
+    command. An unrecognized value is treated as ``inferred`` (the more conservative
+    wording).
     """
     sf_context = shlex.quote(os.fspath(Path(__file__).resolve().parent / "sf-context"))
     inferred = (
@@ -10899,11 +11277,14 @@ def _plugin_install_route_note(name: str, consent: str = "explicit") -> str:
         ),
     }
     opening = openings.get(consent, inferred)
+    client_arg = " --client codex" if _plugin_client(client) == "codex" else ""
     return (
         opening
         + "Advance only that selected plugin by running exactly "
-        + f"{sf_context} plugin-install {name} --accept-proposed "
-        + "with Bash. The guarded runtime will install immediately only when this exact "
+        + f"{sf_context} plugin-install {name} --accept-proposed{client_arg} "
+        + "with Bash."
+        + _codex_install_escalation_note(client)
+        + " The guarded runtime will install immediately only when this exact "
         + "same-session proposal comes from the reviewed Salesforce marketplace. An "
         + "external or mutable source will instead print its source and a nonce-bound "
         + "confirmation request. Relay the command's stdout once and follow only that "
@@ -10937,17 +11318,27 @@ def _plugin_disambiguation_note(candidates: list) -> str:
     )
 
 
-def _plugin_confirm_route_note(name: str, nonce: str) -> str:
+def _plugin_confirm_route_note(
+    name: str, nonce: str, client: object = None,
+) -> str:
     """Model instruction for confirmation of one fresh source preview."""
     sf_context = shlex.quote(os.fspath(Path(__file__).resolve().parent / "sf-context"))
+    active_client = _plugin_client(client)
+    client_arg = " --client codex" if active_client == "codex" else ""
+    handoff = (
+        "a new Codex session and resubmission handoff"
+        if active_client == "codex" else "the required /reload-plugins handoff"
+    )
     return (
         f"The user explicitly confirmed the fresh same-session source preview for the {name} plugin. "
         "Complete only that nonce-bound install by running exactly "
-        f"{sf_context} plugin-install {name} --confirm {nonce} "
-        "with Bash, then relay the command's stdout faithfully. The CLI will independently "
+        f"{sf_context} plugin-install {name} --confirm {nonce}{client_arg} "
+        "with Bash"
+        + _codex_install_escalation_note(client).replace(" Run it", ", run it", 1).rstrip(".")
+        + ", then relay the command's stdout faithfully. The CLI will independently "
         "revalidate the plugin name, source, and nonce. Do not recommend another plugin, do "
         "not substitute a different nonce, and do not continue the original plugin-dependent "
-        "task after installation; stop at the required /reload-plugins handoff."
+        f"task after installation; stop at {handoff}."
     )
 
 
@@ -11021,16 +11412,59 @@ def _claude_config_dir() -> Path:
     return Path(override) if override else Path.home() / ".claude"
 
 
-def _enabled_plugin_names() -> Optional[set]:
-    """Plugin *names* Claude Code currently has enabled, read from the user-level
-    settings.json `enabledPlugins` map (keyed `<name>@<marketplace>`).
+def _enabled_plugin_names(
+    client: object = None, *, runner=subprocess.run, codex_config: Optional[Path] = None,
+) -> Optional[set]:
+    """Return enabled plugin names for Claude Code or Codex.
 
-    None means unknown (unreadable/malformed settings.json) -- this is NOT a
-    security boundary, so callers must fail open toward "uninstalled" rather
-    than suppress a proposal on an unrelated read error. A plugin loaded via
-    `--plugin-dir` (the local dev flow) never appears here at all -- callers must
-    separately exclude the plugin currently running this code.
+    None means unknown (unreadable/malformed host configuration and failed
+    inventory fallback) -- this is NOT a security boundary, so callers must fail
+    open toward "uninstalled" rather than suppress a proposal on an unrelated
+    read error. A plugin loaded via `--plugin-dir` (the local dev flow) never
+    appears here at all -- callers must separately exclude the plugin currently
+    running this code.
     """
+    active_client = _plugin_client(client)
+    if active_client == "codex":
+        config_path = codex_config or Path(
+            os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+        ) / "config.toml"
+        if tomllib is not None:
+            try:
+                data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+                plugins = data.get("plugins") if isinstance(data, dict) else None
+                if isinstance(plugins, dict):
+                    return {
+                        key.split("@", 1)[0] for key, value in plugins.items()
+                        if isinstance(key, str) and isinstance(value, dict)
+                        and value.get("enabled") is True
+                    }
+            except (OSError, UnicodeError, ValueError, TypeError):
+                pass
+        timeout = _bounded_hook_timeout(3)
+        if timeout is None:
+            return None
+        try:
+            result = runner(
+                ["codex", "plugin", "list", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if result.returncode != 0:
+                return None
+            data = json.loads(result.stdout)
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError, TypeError):
+            return None
+        rows = data.get("installed") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return None
+        return {
+            row["name"] for row in rows
+            if isinstance(row, dict) and isinstance(row.get("name"), str)
+            and row.get("installed") is True and row.get("enabled") is True
+        }
     try:
         raw = (_claude_config_dir() / "settings.json").read_text(encoding="utf-8")
         data = json.loads(raw)
@@ -11106,7 +11540,13 @@ def _plugin_curated_match_keywords(module: object, match: object) -> str:
         return ""
 
 
-def _plugin_catalog_match(text: str, session_id: str, surface: str, match_signal: str = "") -> list:
+def _plugin_catalog_match(
+    text: str,
+    session_id: str,
+    surface: str,
+    match_signal: str = "",
+    client: object = None,
+) -> list:
     """Score `text` against the uninstalled-plugin catalog for a proposal
     surface, reconciling first-occurrence state in the session-scoped marker.
 
@@ -11165,7 +11605,11 @@ def _plugin_catalog_match(text: str, session_id: str, surface: str, match_signal
         if not isinstance(plugins, list):
             return []
         current_name = _plugin_display_name()
-        enabled = _enabled_plugin_names()
+        enabled = (
+            _enabled_plugin_names()
+            if client is None
+            else _enabled_plugin_names(_plugin_client(client))
+        )
         candidate_plugins = [
             plugin for plugin in plugins
             if isinstance(plugin, dict) and plugin.get("name") != current_name
@@ -11200,6 +11644,7 @@ def _plugin_catalog_match(text: str, session_id: str, surface: str, match_signal
         selected = [
             match for match in candidates
             if match.plugin.get("name") in uninstalled_names
+            and _plugin_recommendation_supported(match.plugin.get("name"), client)
         ]
         if not selected:
             return []
@@ -11239,7 +11684,7 @@ def _plugin_catalog_match(text: str, session_id: str, surface: str, match_signal
                 "band": match.band,
                 "score": match.score,
                 "first_occurrence": first_occurrence,
-                "install_command": f"{_PLUGIN_INSTALL_COMMAND_PREFIX} {name}",
+                "install_command": _plugin_install_command(name),
                 "match_keywords": match_keywords,
             })
             # W-23856691: fire `plugin_recommended` once per plugin per session --
@@ -11541,12 +11986,28 @@ def _prompt_test_drive_resume_surface(drive_id: str) -> tuple[str, str]:
     readiness/setup gates, so the model relaying it -- rather than reconstructing
     the drive from memory -- is what keeps that boundary intact.
     """
-    command = _sanitize_dynamic_text(f"{_TEST_DRIVE_ENTRY_COMMAND} {drive_id}".strip())
+    codex = _plugin_client() == "codex"
+    if codex:
+        command = _sanitize_dynamic_text(_test_drive_start_phrase(drive_id))
+        activation = "if not recognized, start a new Codex session first"
+        activation_note = (
+            "if the request is not recognized, have them start a new Codex session "
+            "and ask again"
+        )
+        lead_in = ""
+    else:
+        command = _sanitize_dynamic_text(f"{_TEST_DRIVE_ENTRY_COMMAND} {drive_id}".strip())
+        activation = "if unrecognized, run /reload-plugins first"
+        activation_note = (
+            "if the command is not recognized, have them run /reload-plugins "
+            "(or restart the session) first"
+        )
+        lead_in = "run "
     # Option X: the command is the protected `name`, so it never ellipsis-clips; the
     # nudge + activation hedge ride wrap-mode `detail` on a bounded continuation.
     bullet = fit_bullet_line(
-        lead="  • ", name=f"run {command}", separator=" ",
-        detail="to pick it back up — if unrecognized, run /reload-plugins first",
+        lead="  • ", name=f"{lead_in}{command}", separator=" ",
+        detail=f"to pick it back up — {activation}",
         width=80, detail_mode="wrap",
     )
     visible = "\n".join(["🧩 You have a test drive in progress here:", *bullet])
@@ -11557,8 +12018,7 @@ def _prompt_test_drive_resume_surface(drive_id: str) -> tuple[str, str]:
         "run it yourself and do not reconstruct the drive from memory. The command "
         "is the drive's sole entry point and re-runs its own readiness and setup "
         "checks first. The plugin is enabled on disk, but its commands may not be "
-        "active in this running session yet; if the command is not recognized, have "
-        "them run /reload-plugins (or restart the session) first. If they make clear "
+        f"active in this running session yet; {activation_note}. If they make clear "
         "they would rather do something else, drop the drive and help with what they "
         "actually asked."
     )
@@ -11636,8 +12096,7 @@ def _welcome_test_drive_pointer(session_id: str) -> Optional[tuple[str, str]]:
             "name": _TEST_DRIVE_PLUGIN_NAME,
             "description": description,
             "band": "high",
-            "install_command":
-                f"{_PLUGIN_INSTALL_COMMAND_PREFIX} {_TEST_DRIVE_PLUGIN_NAME}",
+            "install_command": _plugin_install_command(_TEST_DRIVE_PLUGIN_NAME),
         }], wrap=80)
 
         # A4 (Option A): commit the ledger FIRST, then open the flow; the render is
@@ -12211,12 +12670,14 @@ def _capability_overview_facts(plugin_root: Optional[Path] = None) -> dict:
             if enabled is not None and name in enabled:
                 data["installed"].append({"name": name, "skills": None})
                 continue
+            if not _plugin_recommendation_supported(name):
+                continue
             match = entry.get("match") if type(entry.get("match")) is dict else {}
             description = match.get("description")
             data["available"].append({
                 "name": name,
                 "description": description if type(description) is str else None,
-                "installCommand": f"{_PLUGIN_INSTALL_COMMAND_PREFIX} {name}",
+                "installCommand": _plugin_install_command(name),
             })
     except Exception:
         pass
@@ -12247,6 +12708,21 @@ _OVERVIEW_ROW_GAP = "   "
 # (_TEST_DRIVE_PLUGIN_NAME, defined with the other plugin constants above): add it
 # while it is only available to add, run this command once it is installed.
 _TEST_DRIVE_COMMAND = "/salesforce-test-drive:start"
+
+
+def _test_drive_start_phrase(drive_id: str = "") -> str:
+    """How to start (or resume) the test drive on the active host.
+
+    Claude names the slash command. Codex has no confirmed slash-command form for a
+    plugin command, so it uses the natural-language request the Codex adapter
+    (`codex-commands/start.md`) is written to receive.
+    """
+    drive_id = drive_id.strip()
+    if _plugin_client() == "codex":
+        if drive_id:
+            return f"ask Codex to resume test drive {drive_id}"
+        return "ask Codex to run the Salesforce Test Drive start workflow"
+    return f"{_TEST_DRIVE_COMMAND} {drive_id}".strip()
 
 
 def _render_capability_overview_lines(data: dict, *, color: bool) -> list[str]:
@@ -12321,7 +12797,10 @@ def _render_capability_overview_lines(data: dict, *, color: bool) -> list[str]:
     installed_names = {row.get("name") for row in (data.get("installed") or [])}
     lead = "Not sure how to start? Take a Salesforce capability for a test drive. "
     if _TEST_DRIVE_PLUGIN_NAME in installed_names:
-        cta = [(lead + "Run ", "warn"), (_TEST_DRIVE_COMMAND, "warn")]
+        if _plugin_client() == "codex":
+            cta = [(lead + "In Codex, ", "warn"), (_test_drive_start_phrase(), "warn")]
+        else:
+            cta = [(lead + "Run ", "warn"), (_TEST_DRIVE_COMMAND, "warn")]
     else:
         cta = [(lead + "Install ", "warn"), (_TEST_DRIVE_PLUGIN_NAME, "warn")]
     lines.append("")
@@ -12452,10 +12931,19 @@ def cmd_prompt_dispatch() -> int:
     payload = _read_hook_payload()
     if (payload.get("hook_event_name") or payload.get("hookEventName")) == "UserPromptExpansion":
         return cmd_command_paint(payload=payload)
-    has_native_prompt = bool(payload.get("prompt_id") or payload.get("promptId"))
-    context = _prompt_context(payload, rotate_fallback=not has_native_prompt)
-    _prune_prompt_runtime(context)
-    return cmd_orientation_paint(payload=payload, prompt_context=context)
+    global _HOOK_DEADLINE
+    if _plugin_client() == "codex":
+        # Codex displays ANSI SGR sequences from this direct hook callback as
+        # literal text. Its hook surfaces use the shared renderer's plain path.
+        os.environ["NO_COLOR"] = "1"
+        _HOOK_DEADLINE = time.monotonic() + _CODEX_PROMPT_BUDGET_SECONDS
+    try:
+        has_native_prompt = bool(payload.get("prompt_id") or payload.get("promptId"))
+        context = _prompt_context(payload, rotate_fallback=not has_native_prompt)
+        _prune_prompt_runtime(context)
+        return cmd_orientation_paint(payload=payload, prompt_context=context)
+    finally:
+        _HOOK_DEADLINE = None
 
 
 # The plugin's discovery command as Claude Code reports it on UserPromptExpansion:
@@ -12693,7 +13181,11 @@ def cmd_orientation_paint(payload: Optional[dict] = None,
             prompt_context = _prompt_context(
                 payload, rotate_fallback=not has_native_prompt)
         prompt = payload.get("prompt", "")
-        session_id = payload.get("session_id") or payload.get("sessionId") or ""
+        client = _plugin_client()
+        _activate_host_working_directory(payload, client)
+        session_id = _plugin_session_id(
+            payload.get("session_id") or payload.get("sessionId") or "", client
+        )
         _record_prompt_text(prompt_context, prompt)
         # Host-injected blocks (IDE notices, task notifications) are never the
         # user's words: every decision check below reads the stripped prompt, and
@@ -12701,6 +13193,17 @@ def cmd_orientation_paint(payload: Optional[dict] = None,
         # only host context leaves both empty and decides nothing.
         prompt = _strip_prompt_host_blocks(prompt)
         intent = _prompt_intent_text(prompt)
+
+        if client == "codex":
+            confirmed_alias = _prod_deploy_confirmation_alias(prompt)
+            if confirmed_alias and _record_prod_deploy_confirmation(session_id, confirmed_alias):
+                emit(
+                    "UserPromptSubmit",
+                    f"The user confirmed one production deploy to {confirmed_alias}. Rerun "
+                    "the blocked deploy command unchanged. The confirmation is single-use, "
+                    "applies only to that org and expires in 10 minutes.",
+                )
+                return 0
 
         # Proposal decisions are session-scoped, not project-scoped. Explicit
         # discovery can open a workflow from any directory, so route every
@@ -12719,9 +13222,13 @@ def cmd_orientation_paint(payload: Optional[dict] = None,
             if confirmed_plugin:
                 name, nonce = confirmed_plugin
                 _select_plugin_flow(session_id, name, "awaiting-confirmation")
+                if client == "codex":
+                    # Codex has no per-command approval prompt, so the CLI
+                    # requires this stamp from the user's own reply.
+                    _confirm_plugin_install_pending(session_id, name, nonce)
                 emit(
                     "UserPromptSubmit",
-                    _plugin_confirm_route_note(name, nonce),
+                    _plugin_confirm_route_note(name, nonce, client),
                 )
                 return 0
 
@@ -12788,7 +13295,9 @@ def cmd_orientation_paint(payload: Optional[dict] = None,
                 _select_plugin_flow(session_id, install_plugin, "selected")
                 emit(
                     "UserPromptSubmit",
-                    _plugin_install_route_note(install_plugin, consent="explicit"),
+                    _plugin_install_route_note(
+                        install_plugin, consent="explicit", client=client,
+                    ),
                 )
                 return 0
 
@@ -12822,7 +13331,7 @@ def cmd_orientation_paint(payload: Optional[dict] = None,
                         emit(
                             "UserPromptSubmit",
                             _plugin_install_route_note(
-                                last_offer["name"], consent="inferred-last-offer"
+                                last_offer["name"], consent="inferred-last-offer", client=client,
                             ),
                         )
                         return 0
@@ -12864,7 +13373,9 @@ def cmd_orientation_paint(payload: Optional[dict] = None,
                 _select_plugin_flow(session_id, flow_plugin, "selected")
                 emit(
                     "UserPromptSubmit",
-                    _plugin_install_route_note(flow_plugin, consent="inferred"),
+                    _plugin_install_route_note(
+                        flow_plugin, consent="inferred", client=client,
+                    ),
                 )
             else:
                 # A generic "yes" cannot pick among several open proposals (no
@@ -13542,7 +14053,10 @@ def cmd_post_ask_question() -> int:
     """
     try:
         payload = _read_hook_payload()
-        session_id = payload.get("session_id") or payload.get("sessionId") or ""
+        client = _plugin_client()
+        session_id = _plugin_session_id(
+            payload.get("session_id") or payload.get("sessionId") or "", client
+        )
         if not session_id:
             print(json.dumps({"continue": True}))
             return 0
@@ -13556,7 +14070,9 @@ def cmd_post_ask_question() -> int:
             _select_plugin_flow(session_id, named[0], "selected")
             emit(
                 "PostToolUse",
-                _plugin_install_route_note(named[0], consent="structured"),
+                _plugin_install_route_note(
+                    named[0], consent="structured", client=client,
+                ),
             )
             return 0
         print(json.dumps({"continue": True}))
@@ -13630,13 +14146,14 @@ def cmd_plugin_match(args: list[str]) -> int:
     as the PreToolUse bypass gate, so a proposal surfaced here suppresses a
     redundant later deny for the same plugin in the same session.
 
-    Usage: sf-context plugin-match [--session-id <id>] [--json]
+    Usage: sf-context plugin-match [--session-id <id>] [--client claude|codex] [--json]
            [--surface discovery-command|session-start] <text>
     `--session-id` is optional. When omitted, Claude Code Bash/PowerShell calls
     use the host-provided `CLAUDE_CODE_SESSION_ID`, so candidates actually shown
     by this command are eligible for a later same-session explicit decline. Other
     hosts without a valid environment id still render but skip marker writes."""
     session_id = ""
+    client = None
     surface = "discovery-command"
     json_mode = False
     remaining = []
@@ -13644,6 +14161,10 @@ def cmd_plugin_match(args: list[str]) -> int:
     while i < len(args):
         if args[i] == "--session-id" and i + 1 < len(args):
             session_id = args[i + 1]
+            i += 2
+            continue
+        if args[i] == "--client" and i + 1 < len(args):
+            client = args[i + 1]
             i += 2
             continue
         if args[i] == "--surface" and i + 1 < len(args):
@@ -13656,12 +14177,16 @@ def cmd_plugin_match(args: list[str]) -> int:
             continue
         remaining.append(args[i])
         i += 1
+    if client is not None and client not in _PLUGIN_CLIENTS:
+        print("Plugin match error: invalid client.", file=sys.stderr)
+        return 2
     if surface not in ("discovery-command", "session-start"):
         print("Plugin match error: invalid proposal surface.", file=sys.stderr)
         return 2
     text = " ".join(remaining).strip()
 
-    session_id = _plugin_session_id(session_id)
+    active_client = _plugin_client(client)
+    session_id = _plugin_session_id(session_id, active_client)
     # SessionStart may call once per project signal and deliberately extends one
     # initial batch. An explicit discovery-command query otherwise stays quiet
     # only while a decision is genuinely in flight (recommended/selected/
@@ -13674,7 +14199,7 @@ def cmd_plugin_match(args: list[str]) -> int:
     flow = _load_plugin_flow(session_id)
     flow_in_progress = flow is not None and flow["state"] not in ("installed", "declined")
     matches = (
-        _plugin_catalog_match(text, session_id, surface=surface)
+        _plugin_catalog_match(text, session_id, surface=surface, client=active_client)
         if surface == "session-start" or not flow_in_progress
         else []
     )
@@ -13740,8 +14265,9 @@ def cmd_plugin_match_config(args: list[str]) -> int:
         print("Plugin recommendation sensitivity")
         print(f"  State:  {state}")
         print(f"  Source: {source}")
-        print("Change it any time: /salesforce-development:plugin-recommendations "
-              "off|on|status|set <low|standard|high|1.0-10.0>")
+        print(_host_text("Change it any time: " + _host_run_prefix()
+                         + "/salesforce-development:plugin-recommendations "
+                         "off|on|status|set <low|standard|high|1.0-10.0>"))
         return 0
 
     if action == "on":
@@ -13751,7 +14277,8 @@ def cmd_plugin_match_config(args: list[str]) -> int:
             return 1
         _fire_plugin_recommendation_configured("reset", "default")
         print("✅ Plugin recommendations reset to the plugin's default sensitivity.\n"
-              "   Check it any time with: /salesforce-development:plugin-recommendations status")
+              + _host_text("   Check it any time with: " + _host_run_prefix()
+                     + "/salesforce-development:plugin-recommendations status"))
         return 0
 
     if action == "off":
@@ -13762,7 +14289,8 @@ def cmd_plugin_match_config(args: list[str]) -> int:
             return 1
         _fire_plugin_recommendation_configured("disable", "off")
         print("🛑 Plugin recommendations are now OFF for this user.\n"
-              "   Turn them back on any time with: /salesforce-development:plugin-recommendations on")
+              + _host_text("   Turn them back on any time with: " + _host_run_prefix()
+                     + "/salesforce-development:plugin-recommendations on"))
         return 0
 
     if action == "set":
@@ -13812,7 +14340,7 @@ _PLUGIN_INSTALL_SUBPROCESS_ENV_KEYS = {
     "PATH", "HOME", "USERPROFILE", "TMPDIR", "TMP", "TEMP",
     "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
     "LANG", "COMSPEC", "SystemRoot", "SYSTEMROOT", "PATHEXT",
-    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CONFIG_DIR", "CODEX_HOME",
 }
 _PLUGIN_INSTALL_TIMEOUT_SECONDS = 120
 _PLUGIN_INSTALL_MAX_STREAM_BYTES = 4000
@@ -13899,7 +14427,7 @@ def _plugin_install_local_marketplace_root() -> Optional[Path]:
     return None
 
 
-def _ensure_salesforce_marketplace_registered(env) -> None:
+def _ensure_salesforce_marketplace_registered(env, client: str = "claude") -> None:
     """Best-effort, idempotent registration of this repo's own "salesforce"
     marketplace so a subsequent `<name>@salesforce` install can resolve.
 
@@ -13923,6 +14451,12 @@ def _ensure_salesforce_marketplace_registered(env) -> None:
     exit/timeout metadata regardless of whether this step ran or why it
     failed."""
     root = _plugin_install_local_marketplace_root()
+    if client == "codex":
+        source = str(root) if root is not None else _SALESFORCE_MARKETPLACE_REPO
+        _run_plugin_install_step(
+            ["codex", "plugin", "marketplace", "add", source, "--json"], env=env
+        )
+        return
     if root is not None:
         _run_plugin_install_step(["claude", "plugin", "marketplace", "add", str(root)], env=env)
         return
@@ -13937,7 +14471,7 @@ def _ensure_salesforce_marketplace_registered(env) -> None:
 PluginInstallLookupResult = namedtuple("PluginInstallLookupResult", ("entry", "reason"))
 
 
-def _plugin_install_lookup(name: str) -> PluginInstallLookupResult:
+def _plugin_install_lookup(name: str, client: object = None) -> PluginInstallLookupResult:
     """Resolve `name` to a reason-carrying plugin install lookup result.
 
     ``reason`` is one of ``ok``, ``catalog_unreadable``, ``unknown``, ``self``,
@@ -13967,7 +14501,7 @@ def _plugin_install_lookup(name: str) -> PluginInstallLookupResult:
         return PluginInstallLookupResult(None, "unknown")
     if entry.get("name") == _plugin_display_name():
         return PluginInstallLookupResult(None, "self")
-    enabled = _enabled_plugin_names()
+    enabled = _enabled_plugin_names(_plugin_client(client))
     if enabled is not None and name in enabled:
         return PluginInstallLookupResult(None, "already_installed")
     return PluginInstallLookupResult(entry, "ok")
@@ -14065,7 +14599,9 @@ def _plugin_install_nonce(name: str, entry: dict) -> str:
     return hashlib.sha256(b"plugin-install-v1\0" + binding).hexdigest()
 
 
-def _render_plugin_install_dry_run(name: str, entry: dict, nonce: str) -> str:
+def _render_plugin_install_dry_run(
+    name: str, entry: dict, nonce: str, client: str = "claude",
+) -> str:
     source = entry.get("source")
     source_text = source if isinstance(source, str) else json.dumps(source, sort_keys=True)
     marketplace = _plugin_install_marketplace_name(name, entry)
@@ -14090,11 +14626,18 @@ def _render_plugin_install_dry_run(name: str, entry: dict, nonce: str) -> str:
     lines.append("")
     lines.append("Relay the above to the user and obtain their explicit confirmation --")
     lines.append("never infer it. Once confirmed, run:")
-    lines.append(f"  sf-context plugin-install {name} --confirm {nonce}")
-    lines.append(
-        "After installation, the user must run /reload-plugins before work that "
-        "depends on this plugin continues."
-    )
+    client_arg = " --client codex" if client == "codex" else ""
+    lines.append(f"  sf-context plugin-install {name} --confirm {nonce}{client_arg}")
+    if client == "codex":
+        lines.append(
+            "After installation, start a new Codex session and resubmit the request "
+            "before work that depends on this plugin continues."
+        )
+    else:
+        lines.append(
+            "After installation, the user must run /reload-plugins before work that "
+            "depends on this plugin continues."
+        )
     return "\n".join(lines)
 
 
@@ -14108,6 +14651,7 @@ def _plugin_install_args(args: list[str]) -> Optional[dict]:
         "decline": False,
         "accept_proposed": False,
         "session_id": "",
+        "client": None,
     }
     seen: set = set()
     index = 0
@@ -14127,10 +14671,11 @@ def _plugin_install_args(args: list[str]) -> Optional[dict]:
             seen.add(arg)
             index += 1
             continue
-        if arg in ("--confirm", "--session-id"):
+        if arg in ("--confirm", "--session-id", "--client"):
             if arg in seen or index + 1 >= len(args):
                 return None
-            parsed["confirm" if arg == "--confirm" else "session_id"] = args[index + 1]
+            key = {"--confirm": "confirm", "--session-id": "session_id", "--client": "client"}[arg]
+            parsed[key] = args[index + 1]
             seen.add(arg)
             index += 2
             continue
@@ -14146,6 +14691,8 @@ def _plugin_install_args(args: list[str]) -> Optional[dict]:
     if parsed["name"] is None or actions > 1:
         return None
     if parsed["confirm"] is not None and not _PLUGIN_INSTALL_NONCE.fullmatch(parsed["confirm"]):
+        return None
+    if parsed["client"] is not None and parsed["client"] not in _PLUGIN_CLIENTS:
         return None
     return parsed
 
@@ -14324,13 +14871,18 @@ def _cmd_plugin_install_decline(name: str, session_id: str) -> int:
     return 0
 
 
-def _perform_plugin_install(name: str, entry: dict, session_id: str) -> int:
+def _perform_plugin_install(
+    name: str, entry: dict, session_id: str, client: str = "claude",
+) -> int:
     """Install one already-authorized entry and render the activation handoff."""
     marketplace = _plugin_install_marketplace_name(name, entry)
-    _ensure_salesforce_marketplace_registered(os.environ)
-    ok, execution = _run_plugin_install_step(
-        ["claude", "plugin", "install", f"{name}@{marketplace}", "--yes"], env=os.environ
+    _ensure_salesforce_marketplace_registered(os.environ, client)
+    command = (
+        ["codex", "plugin", "add", f"{name}@{marketplace}", "--json"]
+        if client == "codex"
+        else ["claude", "plugin", "install", f"{name}@{marketplace}", "--yes"]
     )
+    ok, execution = _run_plugin_install_step(command, env=os.environ)
     if not ok:
         message = (
             f"Plugin install failed for {name}@{marketplace} "
@@ -14338,12 +14890,18 @@ def _perform_plugin_install(name: str, entry: dict, session_id: str) -> int:
         )
         # `marketplace update` only works once the marketplace exists, so name
         # `add` for the unregistered case and `update` for the stale case.
-        message += (
-            f"\nIf {marketplace!r} is not registered, run "
-            f"`claude plugin marketplace add {_SALESFORCE_MARKETPLACE_REPO}`; "
-            f"if it is registered but stale, run "
-            f"`claude plugin marketplace update {marketplace}`. Then retry."
-        )
+        if client == "codex":
+            message += (
+                "\nVerify the marketplace is registered with `codex plugin marketplace list` "
+                "and retry the guarded install."
+            )
+        else:
+            message += (
+                f"\nIf {marketplace!r} is not registered, run "
+                f"`claude plugin marketplace add {_SALESFORCE_MARKETPLACE_REPO}`; "
+                f"if it is registered but stale, run "
+                f"`claude plugin marketplace update {marketplace}`. Then retry."
+            )
         print(message, file=sys.stderr)
         _fire_plugin_install_result("subprocess_failure", session_id, name)
         return 3
@@ -14363,11 +14921,17 @@ def _perform_plugin_install(name: str, entry: dict, session_id: str) -> int:
             f"After the refreshed inventory shows {name} is active, submit a "
             "concrete task to begin using it."
         )
-    print(
-        f"Installed {name} on disk; it is not active in this session yet.\n"
-        "Run /reload-plugins now.\n"
-        f"{after_reload} If it does not appear after reload, start a fresh session."
-    )
+    if client == "codex":
+        print(
+            f"Installed {name} on disk; it is not active in this session yet.\n"
+            "Start a new Codex session and resubmit the request."
+        )
+    else:
+        print(
+            f"Installed {name} on disk; it is not active in this session yet.\n"
+            "Run /reload-plugins now.\n"
+            f"{after_reload} If it does not appear after reload, start a fresh session."
+        )
     _fire_plugin_install_result("installed", session_id, name)
     return 0
 
@@ -14375,11 +14939,12 @@ def _perform_plugin_install(name: str, entry: dict, session_id: str) -> int:
 def cmd_plugin_install(args: list[str]) -> int:
     """Install one uninstalled catalog entry through a guarded trust path.
 
-    Usage: sf-context plugin-install <name> [--accept-proposed | --confirm <nonce> | --decline] [--session-id <id>]
+    Usage: sf-context plugin-install <name> [--accept-proposed | --confirm <nonce> | --decline] [--session-id <id>] [--client claude|codex]
 
-    An omitted `--session-id` resolves from Claude Code's validated
-    `CLAUDE_CODE_SESSION_ID` subprocess environment. Without either, proposal
-    correlation remains unavailable and decline therefore refuses.
+    An omitted `--session-id` resolves from the active host's validated session
+    environment. Claude retains its existing marker namespace; Codex markers are
+    separately namespaced. Without either, proposal correlation remains
+    unavailable and decline therefore refuses.
 
     ``--accept-proposed`` requires an exact, selected same-session proposal. A
     reviewed same-marketplace source installs immediately because the user's
@@ -14398,13 +14963,14 @@ def cmd_plugin_install(args: list[str]) -> int:
     parsed = _plugin_install_args(args)
     if parsed is None:
         print(
-            "Usage: sf-context plugin-install <name> [--accept-proposed | --confirm <nonce> | --decline] [--session-id <id>]",
+            "Usage: sf-context plugin-install <name> [--accept-proposed | --confirm <nonce> | --decline] [--session-id <id>] [--client claude|codex]",
             file=sys.stderr,
         )
         _fire_plugin_install_result("usage_error", _plugin_session_id(""))
         return 2
     name = parsed["name"]
-    session_id = _plugin_session_id(parsed["session_id"])
+    client = _plugin_client(parsed["client"])
+    session_id = _plugin_session_id(parsed["session_id"], client)
     if len(name) > 64 or not _SKILL_NAME_PATTERN.fullmatch(name):
         print(f"Plugin install refused: {name!r} is not a valid plugin name.", file=sys.stderr)
         _fire_plugin_install_result("invalid_name", session_id)
@@ -14413,7 +14979,7 @@ def cmd_plugin_install(args: list[str]) -> int:
     if parsed["decline"]:
         return _cmd_plugin_install_decline(name, session_id)
 
-    lookup = _plugin_install_lookup(name)
+    lookup = _plugin_install_lookup(name, client)
     if lookup.reason != "ok" or lookup.entry is None:
         _clear_plugin_install_pending(session_id, name)
         print(
@@ -14435,6 +15001,33 @@ def cmd_plugin_install(args: list[str]) -> int:
 
     nonce = _plugin_install_nonce(name, entry)
     if parsed["accept_proposed"]:
+        if not _plugin_recommendation_supported(name, client):
+            _clear_plugin_install_pending(session_id, name)
+            proposals = _load_plugin_proposals(session_id)
+            if name in proposals:
+                proposals.pop(name)
+                _save_plugin_proposals(session_id, proposals)
+            flow = _load_plugin_flow(session_id)
+            if flow is not None and name in flow["candidates"]:
+                remaining = [candidate for candidate in flow["candidates"] if candidate != name]
+                if flow.get("selected") == name or not remaining:
+                    _clear_plugin_flow(session_id)
+                else:
+                    _save_plugin_flow(
+                        session_id, remaining, selected=flow.get("selected"),
+                        state=flow["state"], surface=flow["surface"],
+                        task_backed=flow["taskBacked"],
+                    )
+            offer = _load_plugin_last_offer(session_id)
+            if offer is not None and offer.get("name") == name:
+                _clear_plugin_last_offer(session_id)
+            print(
+                f"Plugin recommendation unavailable: {name} end-to-end Codex workflows "
+                "are not yet verified. This plugin is not recommended for Codex.",
+                file=sys.stderr,
+            )
+            _fire_plugin_install_result("proposal_not_selected", session_id, name)
+            return 2
         if _selected_plugin_proposal(name, session_id) is None:
             _clear_plugin_install_pending(session_id, name)
             print(
@@ -14445,16 +15038,18 @@ def cmd_plugin_install(args: list[str]) -> int:
             _fire_plugin_install_result("proposal_not_selected", session_id, name)
             return 2
         if _plugin_install_is_trusted_source(name, entry):
+            if client == "codex":
+                return _perform_plugin_install(name, entry, session_id, client)
             return _perform_plugin_install(name, entry, session_id)
         _save_plugin_install_pending(session_id, name, nonce)
         _select_plugin_flow(session_id, name, "awaiting-confirmation")
-        print(_render_plugin_install_dry_run(name, entry, nonce))
+        print(_render_plugin_install_dry_run(name, entry, nonce, client))
         _fire_plugin_install_result("previewed", session_id, name)
         return 0
     if parsed["confirm"] is None:
         _save_plugin_install_pending(session_id, name, nonce)
         _select_plugin_flow(session_id, name, "awaiting-confirmation")
-        print(_render_plugin_install_dry_run(name, entry, nonce))
+        print(_render_plugin_install_dry_run(name, entry, nonce, client))
         _fire_plugin_install_result("previewed", session_id, name)
         return 0
     if not hmac.compare_digest(parsed["confirm"], nonce):
@@ -14468,6 +15063,21 @@ def cmd_plugin_install(args: list[str]) -> int:
         _fire_plugin_install_result("stale_nonce", session_id, name)
         return 3
 
+    if client == "codex":
+        if not _consume_plugin_install_pending(
+            session_id, name, nonce, require_user_confirmation=True,
+        ):
+            _clear_plugin_install_pending(session_id)
+            _select_plugin_flow(session_id, name, "selected")
+            print(
+                "Plugin install confirmation failed because no fresh source preview in "
+                "this session has the user's own confirmation reply. Run the dry run "
+                "again, relay it, and ask the user to confirm that exact source.",
+                file=sys.stderr,
+            )
+            _fire_plugin_install_result("stale_nonce", session_id, name)
+            return 3
+        return _perform_plugin_install(name, entry, session_id, client)
     return _perform_plugin_install(name, entry, session_id)
 
 

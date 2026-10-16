@@ -7,6 +7,14 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-16
+
+### Added
+
+- `salesforce-test-drive` now supports Codex, and so does every plugin it can require. On Codex, a
+  drive can recommend and install any Salesforce marketplace plugin, then resume in a new session.
+  Claude Code behavior is unchanged.
+
 ## [0.1.1] — 2026-10-02
 
 ### Changed
