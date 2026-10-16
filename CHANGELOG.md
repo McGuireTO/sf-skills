@@ -1,3 +1,12 @@
+# [1.66.0](https://github.com/forcedotcom/sf-skills/compare/1.65.1...1.66.0) (2026-10-16)
+
+
+### Features
+
+* Release 14 skills (2 new, 12 updated) - sf-skills public @W-24535066@ ([62d3e25](https://github.com/forcedotcom/sf-skills/commit/62d3e253cfaa7916eef7c86c74ac09eab786306b))
+
+
+
 ## [1.65.1](https://github.com/forcedotcom/sf-skills/compare/1.65.0...1.65.1) (2026-10-15)
 
 
